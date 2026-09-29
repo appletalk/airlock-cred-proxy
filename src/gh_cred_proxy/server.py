@@ -5,6 +5,7 @@ CONNECT and then speak plain HTTP (git and curl, via http.proxy=socks5h://localh
 """
 import grp
 import http.client
+import io
 import itertools
 import json
 import os
@@ -41,6 +42,7 @@ STRIP_REQUEST = HOP_BY_HOP | {"host", "authorization", "cookie", "expect", "cont
 STRIP_RESPONSE = HOP_BY_HOP | {"content-length", "set-cookie"}
 METHOD_OVERRIDE = ("x-http-method-override", "x-http-method", "x-method-override")
 HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")   # RFC 9110 token
+BAD_HEADER_VALUE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")      # controls other than tab
 CANONICAL_PATH = re.compile(r"/[\x21-\x7e]*")
 BAD_PATH = re.compile(r"%(2e|2f|5c|00)|\\", re.I)
 
@@ -132,14 +134,44 @@ _inspect_slots = threading.BoundedSemaphore(INSPECT_SLOTS)
 
 
 def inspect(it, limit, decide):
-    """Buffer an inspected body and decide on it, with at most INSPECT_SLOTS doing so at once."""
+    """Buffer an inspected body, then decide on it with at most INSPECT_SLOTS parsing at once.
+
+    The slot covers only the parse, so a slow upload cannot hold one.
+    """
+    raw = buffer_body(it, limit)
     if not _inspect_slots.acquire(timeout=INSPECT_WAIT):
         raise Refused(503, "too many requests being inspected")
     try:
-        raw = buffer_body(it, limit)
         return raw, decide(raw)
     finally:
         _inspect_slots.release()
+
+
+class DeadlineSocketIO(io.RawIOBase):
+    """The raw stream under the handler's rfile. Every recv times out at the handler's deadline.
+
+    A per-recv timeout alone lets a client that drips bytes hold its slot forever, and one
+    buffered readline() makes many recvs, so the deadline is applied here, below the buffer.
+    No thread per connection.
+    """
+
+    def __init__(self, sock, handler):
+        super().__init__()
+        self._sock, self._h = sock, handler
+
+    def readable(self):
+        return True
+
+    def readinto(self, b):
+        at = self._h.deadline_at
+        if at is None:
+            self._sock.settimeout(CLIENT_TIMEOUT)
+        else:
+            left = at - time.monotonic()
+            if left <= 0:
+                raise TimeoutError("request deadline passed")
+            self._sock.settimeout(min(CLIENT_TIMEOUT, left))
+        return self._sock.recv_into(b)
 
 
 def buffer_body(it, limit):
@@ -270,28 +302,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def setup(self):
         super().setup()
-        # A per-recv timeout lets a client that drips bytes hold its slot forever; this bounds
-        # the whole phase before the request is authorised. Disarmed before streaming upstream.
-        self._deadline = threading.Timer(REQUEST_DEADLINE, self._expire)
-        self._deadline.daemon = True
-        self._deadline.start()
+        # Everything before authorisation must arrive within REQUEST_DEADLINE; cleared
+        # (deadline_at = None) once the request is allowed and about to stream upstream.
+        self.deadline_at = time.monotonic() + REQUEST_DEADLINE
+        self.rfile.close()
+        self.rfile = io.BufferedReader(DeadlineSocketIO(self.connection, self), CHUNK)
         try:
+            self.connection.settimeout(min(CLIENT_TIMEOUT, REQUEST_DEADLINE))
             if self.request.recv(1, socket.MSG_PEEK) == b"\x05":
                 self.socks_target = self._socks()
         except (Refused, OSError, ValueError) as e:
             self.server.proxy.audit.write({"ts": now(), "peer": self._peer(), "decision": "deny",
                                            "reason": f"socks: {getattr(e, 'reason', None) or e}"})
             raise ConnectionAbortedError("socks handshake refused")
-
-    def _expire(self):
-        try:
-            self.request.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
-
-    def finish(self):
-        self._deadline.cancel()
-        super().finish()
 
     def _socks(self):
         """Minimal SOCKS5 (RFC 1928): no auth, CONNECT by domain name to a proxied host on port 80."""
@@ -376,7 +399,7 @@ class Handler(BaseHTTPRequestHandler):
             # "payload", silently dropping those headers. Anything left over is a malformed request.
             if self.headers.defects or self.headers.get_payload() \
                     or not all(HEADER_NAME.fullmatch(k) for k in self.headers.keys()) \
-                    or any("\r" in v or "\n" in v for v in self.headers.values()):
+                    or any(BAD_HEADER_VALUE.search(v) for v in self.headers.values()):
                 raise Refused(400, "malformed header block")
             if not CANONICAL_PATH.fullmatch(path) or BAD_PATH.search(path) or "//" in path \
                     or any(seg in (".", "..") for seg in path.split("/")):
@@ -387,7 +410,6 @@ class Handler(BaseHTTPRequestHandler):
                 raise Refused(400, "Host does not match the SOCKS target")
 
             if path in (IDENTITY_PATH, HEALTH_PATH):
-                self._deadline.cancel()
                 self._local(px, path)
                 rec.update(decision="local", status=200)
                 return
@@ -396,6 +418,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise Refused(400, "method-override headers are not accepted")
             if query and self.command not in policy.READ_METHODS and host == cfg.api_host:
                 raise Refused(400, "query strings on writes are not accepted")
+            if host == cfg.api_host and len(path) > 1 and path.endswith("/"):
+                raise Refused(400, "API paths do not end in /")
 
             body, length = body_reader(self)
             if host == cfg.git_host:
@@ -419,6 +443,10 @@ class Handler(BaseHTTPRequestHandler):
                     body = itertools.chain([parser.consumed], body)
                 upstream = cfg.git_url
             elif host == cfg.api_host:
+                inspected = (self.command == "POST" and path == "/graphql") \
+                    or policy.rest_needs_body(self.command, path)
+                if inspected and self.headers.get("Content-Encoding"):
+                    raise Refused(400, "encoded bodies cannot be inspected")
                 if self.command == "POST" and path == "/graphql":
                     raw, d = inspect(body, MAX_INSPECT, lambda b: policy.graphql_request(pol, b))
                     body, length = iter([raw]), len(raw)
@@ -438,7 +466,7 @@ class Handler(BaseHTTPRequestHandler):
                 px.resolve_lookup(d)
             scope = px.scope(d.repo)
             perms = px.perms(d.access)
-            self._deadline.cancel()
+            self.deadline_at = None
             try:
                 auth = px.cred.git_authorization(scope, perms) if git else px.cred.authorization(scope, perms)
             except (credentials.UpstreamError, KeyError, ValueError) as e:
@@ -516,7 +544,14 @@ class UnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
         if not self._slots.acquire(blocking=False):
             self._release_peer(uid)
             return self._busy(request, "too many connections")
-        super().process_request(request, (uid,))
+        try:
+            super().process_request(request, (uid,))
+        except BaseException:
+            # The thread never started, so process_request_thread will not release these.
+            self._slots.release()
+            self._release_peer(uid)
+            self.proxy.audit.write({"ts": now(), "decision": "error", "reason": "could not start handler thread"})
+            raise
 
     def _release_peer(self, uid):
         with self._peers_lock:

@@ -18,7 +18,8 @@ LogsDirectoryMode=0750
 UMask=0077
 Restart=on-failure
 MemoryMax=512M
-TasksMax=128
+# One thread per connection (MAX_CONNECTIONS=64) plus headroom.
+TasksMax=160
 
 NoNewPrivileges=yes
 ProtectSystem=strict

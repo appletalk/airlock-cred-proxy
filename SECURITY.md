@@ -65,6 +65,16 @@ reaches the socket as a SOCKS5 proxy.
   should still require reviews on those branches.
 - The proxy does not inspect pack contents. It does not stop the agent pushing
   secrets or large files to an allowed branch.
+- Allowed actions can have effects the proxy does not see:
+  - Labels and comments can trigger merge bots and label-driven auto-merge workflows.
+    Do not run such automation on repos an agent works in, or restrict it to human
+    actors.
+  - Pushes made with a GitHub App token trigger workflows, unlike `GITHUB_TOKEN`. A push
+    to an allowed branch runs CI with whatever the agent put in the scripts it calls.
+    Keep the agent's branch patterns out of workflows and environments that hold
+    secrets.
+  - `updateIssueComment` and `deleteIssueComment` work on other people's comments where
+    the credential allows it. Remove them from `graphql_mutations` if that matters.
 - GitHub Enterprise Server is untested.
 
 ## Reporting

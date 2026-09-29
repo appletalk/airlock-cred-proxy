@@ -8,7 +8,9 @@ import subprocess
 import tempfile
 import threading
 import time
+import socketserver
 import unittest
+from unittest import mock
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -482,6 +484,70 @@ class ProxyTest(unittest.TestCase):
         self.assertTrue(resp.startswith(b"HTTP/1.1 400"), resp[:80])
         resp = self.raw(b"GET /repos/acme/app HTTP/1.1\r\nHost: api.github.com\r\n X-Folded: x\r\n\r\n")
         self.assertTrue(resp.startswith(b"HTTP/1.1 400"), resp[:80])
+
+    # ------------------------------------------------------------ review round 3 regressions
+
+    def test_refused_handshakes_leave_no_threads(self):
+        time.sleep(0.3)
+        before = threading.active_count()
+        for _ in range(40):
+            c = socket.socket(socket.AF_UNIX)
+            c.connect(self.sock)
+            c.sendall(b"\x05\x01\x00\x05\x01\x00\x01\x7f\x00\x00\x01\x00\x50")
+            c.settimeout(2)
+            try:
+                c.recv(64)
+            except OSError:
+                pass
+            c.close()
+        time.sleep(0.5)
+        self.assertLessEqual(threading.active_count(), before + 1)
+
+    def test_thread_start_failure_releases_slots(self):
+        with mock.patch.object(socketserver.ThreadingMixIn, "process_request", side_effect=RuntimeError("no thread")):
+            for _ in range(3):
+                c = socket.socket(socket.AF_UNIX)
+                c.connect(self.sock)
+                c.settimeout(2)
+                try:
+                    c.recv(64)
+                except OSError:
+                    pass
+                c.close()
+            time.sleep(0.3)
+        self.assertEqual(self.srv._per_peer, {})
+        self.assertEqual(self.srv._slots._value, server.MAX_CONNECTIONS)
+        self.assertEqual(self.api("GET", "/repos/acme/app")[0], 200)
+
+    def test_slow_uploads_do_not_hold_parse_slots(self):
+        slow = []
+        old = server.INSPECT_WAIT
+        server.INSPECT_WAIT = 1
+        try:
+            for _ in range(server.INSPECT_SLOTS + 2):
+                c = socket.socket(socket.AF_UNIX)
+                c.connect(self.sock)
+                c.sendall(b"POST /graphql HTTP/1.1\r\nHost: api.github.com\r\nContent-Length: 100\r\n\r\n{")
+                slow.append(c)
+            time.sleep(0.3)
+            self.assertEqual(self.gql("query { viewer { login } }")[0], 200)
+        finally:
+            server.INSPECT_WAIT = old
+            for c in slow:
+                c.close()
+
+    def test_header_control_characters_refused(self):
+        resp = self.raw(b"GET /repos/acme/app HTTP/1.1\r\nHost: api.github.com\r\nX-Foo: a\x00b\x0bc\r\n\r\n")
+        self.assertTrue(resp.startswith(b"HTTP/1.1 400"), resp[:80])
+
+    def test_encoded_inspected_body_refused(self):
+        status, _ = self.api("POST", "/graphql", {"query": "query { viewer { login } }"},
+                             headers={"Content-Encoding": "br"})
+        self.assertEqual(status, 400)
+
+    def test_trailing_slash_refused(self):
+        self.assertEqual(self.api("GET", "/repos/acme/app/releases/assets/1/")[0], 400)
+        self.assertEqual(self.api("GET", "/repos/acme/app/issues/")[0], 400)
 
     def test_release_asset_download_refused(self):
         self.assertEqual(self.api("GET", "/repos/acme/app/releases/assets/12",
