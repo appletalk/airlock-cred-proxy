@@ -51,10 +51,14 @@ reaches the socket as a SOCKS5 proxy.
   retarget that lands between the check and GitHub acting on the merge is not caught.
   Retargeting onto a protected base is itself refused, so this needs a second actor.
   GitHub branch protection on those branches is the backstop.
-- Responses are passed through. Some GitHub responses carry short-lived signed URLs
-  (contents `download_url` for private repos) that work without the proxy until they
-  expire. They are read-only and cover repos the agent can already read. Archive
-  downloads, whose redirects carry such URLs, are refused.
+- Responses are passed through. GitHub-signed URLs in responses work without the proxy
+  until they expire: contents `download_url` for private repos, image links in rendered
+  `body_html` / `bodyHTML`, and Actions log or artifact redirects if the App ever has
+  Actions access. They are read-only and cover content the agent could already read
+  through the proxy. Archive and release-asset downloads, whose redirects are such URLs,
+  are refused.
+- A client in the socket group can use up to its per-uid connection share and slow the
+  service for others sharing that uid.
 - Anyone in the socket's group can use the identity.
 - Allowed branches are only as safe as the branch protection behind them. The proxy
   keeps the agent off protected branches. It does not replace GitHub rulesets, which

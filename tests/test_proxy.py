@@ -386,24 +386,106 @@ class ProxyTest(unittest.TestCase):
         c.close()
         self.assertTrue(resp.startswith(b"HTTP/1.1 413"), resp[:80])
 
-    def test_connection_cap_answers_busy(self):
+    def hold(self, n):
         held = []
+        for _ in range(n):
+            c = socket.socket(socket.AF_UNIX)
+            c.connect(self.sock)
+            held.append(c)
+        time.sleep(0.3)
+        return held
+
+    def busy_reply(self):
+        extra = socket.socket(socket.AF_UNIX)
+        extra.connect(self.sock)
+        extra.settimeout(5)
         try:
-            for _ in range(server.MAX_CONNECTIONS):
-                c = socket.socket(socket.AF_UNIX)
-                c.connect(self.sock)
-                held.append(c)
-            time.sleep(0.3)
-            extra = socket.socket(socket.AF_UNIX)
-            extra.connect(self.sock)
-            extra.settimeout(5)
-            self.assertTrue(extra.recv(64).startswith(b"HTTP/1.1 503"))
+            return extra.recv(64)
+        finally:
             extra.close()
+
+    def test_per_uid_cap_answers_busy(self):
+        held = self.hold(server.MAX_PER_PEER)
+        try:
+            self.assertTrue(self.busy_reply().startswith(b"HTTP/1.1 503"))
         finally:
             for c in held:
                 c.close()
         time.sleep(0.3)
         self.assertEqual(self.api("GET", "/repos/acme/app")[0], 200)
+        with open(self.audit_path) as f:
+            self.assertIn("too many connections from this uid", f.read())
+
+    def test_global_cap_answers_busy(self):
+        old = server.MAX_PER_PEER
+        server.MAX_PER_PEER = 10 ** 6
+        held = []
+        try:
+            held = self.hold(server.MAX_CONNECTIONS)
+            self.assertTrue(self.busy_reply().startswith(b"HTTP/1.1 503"))
+        finally:
+            server.MAX_PER_PEER = old
+            for c in held:
+                c.close()
+        time.sleep(0.3)
+        self.assertEqual(self.api("GET", "/repos/acme/app")[0], 200)
+
+    def test_dripping_client_loses_its_slot(self):
+        old = server.REQUEST_DEADLINE
+        server.REQUEST_DEADLINE = 1.5
+        try:
+            c = socket.socket(socket.AF_UNIX)
+            c.connect(self.sock)
+            t0 = time.monotonic()
+            closed = False
+            for b in b"GET /repos/acme/app HTTP/1.1\r\nX-Slow: " + b"a" * 100:
+                try:
+                    c.sendall(bytes([b]))
+                except (BrokenPipeError, ConnectionResetError):
+                    closed = True
+                    break
+                time.sleep(0.2)
+                if time.monotonic() - t0 > 6:
+                    break
+            if not closed:
+                c.settimeout(2)
+                try:
+                    closed = c.recv(1) == b""
+                except (ConnectionResetError, TimeoutError, OSError):
+                    closed = True
+            c.close()
+            self.assertTrue(closed)
+            self.assertLess(time.monotonic() - t0, 5)
+        finally:
+            server.REQUEST_DEADLINE = old
+
+    def test_inspection_slots_bounded(self):
+        taken = []
+        try:
+            for _ in range(server.INSPECT_SLOTS):
+                self.assertTrue(server._inspect_slots.acquire(blocking=False))
+                taken.append(1)
+            old = server.INSPECT_WAIT
+            server.INSPECT_WAIT = 0.5
+            try:
+                self.assertEqual(self.gql("query { viewer { login } }")[0], 503)
+            finally:
+                server.INSPECT_WAIT = old
+        finally:
+            for _ in taken:
+                server._inspect_slots.release()
+        self.assertEqual(self.gql("query { viewer { login } }")[0], 200)
+
+    def test_header_names_must_be_tokens(self):
+        resp = self.raw(b"POST /repos/acme/app/issues HTTP/1.1\r\nHost: api.github.com\r\n"
+                        b"X-HTTP-Method-Override : DELETE\r\nContent-Length: 2\r\n\r\n{}")
+        self.assertTrue(resp.startswith(b"HTTP/1.1 400"), resp[:80])
+        resp = self.raw(b"GET /repos/acme/app HTTP/1.1\r\nHost: api.github.com\r\n X-Folded: x\r\n\r\n")
+        self.assertTrue(resp.startswith(b"HTTP/1.1 400"), resp[:80])
+
+    def test_release_asset_download_refused(self):
+        self.assertEqual(self.api("GET", "/repos/acme/app/releases/assets/12",
+                                  headers={"Accept": "application/octet-stream"})[0], 403)
 
     def test_audit_log_has_no_tokens(self):
         self.api("GET", "/repos/acme/app/issues")

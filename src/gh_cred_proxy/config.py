@@ -18,14 +18,15 @@ DEFAULT_MUTATIONS = frozenset({
     "updateIssueComment", "updatePullRequest",
 })
 
-# Mutations that move refs or merge without a checker in this proxy. They cannot be enabled:
-# auto-merge and the merge queue act later, after the base can have been retargeted.
-NEVER_MUTATIONS = frozenset({
-    "enablePullRequestAutoMerge", "enqueuePullRequest", "createCommitOnBranch", "mergeBranch",
-    "updateRefs", "createRef", "updateRef", "deleteRef", "updatePullRequestBranch",
-    "revertPullRequest",
-    "cloneTemplateRepository", "createRepository", "deleteRepository", "transferRepository",
-    "updateBranchProtectionRule", "deleteBranchProtectionRule", "createBranchProtectionRule",
+# Every mutation the proxy has classified: the defaults, which it checks or knows to be
+# harmless for a PR and issue workflow, plus a few that only touch project boards and
+# reactions. graphql_mutations may only name these; anything else is a config error, so a
+# new or unfamiliar mutation is never enabled by accident. Auto-merge and the merge queue are
+# deliberately absent: they act later, after the base can have been retargeted.
+SAFE_MUTATIONS = DEFAULT_MUTATIONS | frozenset({
+    "addProjectV2ItemById", "archiveProjectV2Item", "clearProjectV2ItemFieldValue",
+    "deleteProjectV2Item", "unarchiveProjectV2Item", "updateProjectV2ItemFieldValue",
+    "updateProjectV2ItemPosition", "addReaction", "removeReaction",
 })
 
 DEFAULT_READ_PATHS = ("/rate_limit", "/meta", "/zen", "/users/*")
@@ -137,10 +138,11 @@ def parse(data: dict) -> Config:
     repo_tables = pol.get("repo", {})
     mutations = pol.get("graphql_mutations")
     if mutations is not None:
-        bad = sorted(set(mutations) & NEVER_MUTATIONS)
-        if bad:
-            raise ConfigError(f"policy.graphql_mutations cannot include {', '.join(bad)}: "
-                              "they move refs or merge without a check this proxy can make")
+        unknown = sorted(set(mutations) - SAFE_MUTATIONS)
+        if unknown:
+            raise ConfigError(f"policy.graphql_mutations names mutations this proxy has not classified: "
+                              f"{', '.join(unknown)}. Mutations that move refs or merge without a check "
+                              "(auto-merge, merge queue, createCommitOnBranch, updateRefs) are never classified.")
     policy = Policy(
         repos=list(repos),
         permissions=perms,

@@ -140,7 +140,24 @@ class ReviewRound1(unittest.TestCase):
                                              b'{"event":["APPROVE"]}').allow)
 
 
+class ReviewRound2(unittest.TestCase):
+    def test_depth_precheck_ignores_brackets_in_strings(self):
+        q = 'query { a(x: "' + "}" * 200 + '") ' + "{b" * 100 + "}" * 100 + " }"
+        self.assertTrue(policy._too_deep(q))
+        q = 'query { a(x: """' + "}" * 200 + '""") ' + "{b" * 100 + "}" * 100 + " }"
+        self.assertTrue(policy._too_deep(q))
+        q = "query { a # " + "}" * 200 + "\n" + "{b" * 100 + "}" * 100 + " }"
+        self.assertTrue(policy._too_deep(q))
+        self.assertFalse(policy._too_deep('query { a(x: "' + "{" * 200 + '") { b } }'))
+
+
 class Config(unittest.TestCase):
+    def test_unclassified_mutations_refused(self):
+        for m in ("createLinkedBranch", "dismissPullRequestReview", "someFutureMutation"):
+            with self.assertRaises(config.ConfigError, msg=m):
+                pol(graphql_mutations=["createPullRequest", m])
+        pol(graphql_mutations=["createPullRequest", "updateProjectV2ItemFieldValue"])
+
     def test_never_mutations_cannot_be_enabled(self):
         for m in ("enablePullRequestAutoMerge", "createCommitOnBranch", "updateRefs", "enqueuePullRequest"):
             with self.assertRaises(config.ConfigError, msg=m):

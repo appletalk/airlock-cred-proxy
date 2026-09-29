@@ -15,7 +15,6 @@ MUTANTS = [
  ("mutation allowlist", "policy.py", 'if name not in policy.mutations:', 'if False:'),
  ("graphql retarget check", "policy.py", 'lookups.append({"id": pr, "base": normalise_branch(base)})', 'pass'),
  ("auto-merge out of defaults", "config.py", '"markPullRequestReadyForReview", "mergePullRequest",', '"markPullRequestReadyForReview", "mergePullRequest", "enablePullRequestAutoMerge",'),
- ("never-mutations at load", "config.py", 'bad = sorted(set(mutations) & NEVER_MUTATIONS)', 'bad = []'),
  ("percent and /repos/ shape", "policy.py", 'if "%" in path and not CONTENTS_PATH.match(path):\n        return deny("percent-encoding is only accepted in a contents file path")\n    rm = REPO_PATH.match(path)\n    if path.startswith("/repos/") and not rm:\n        return deny("unrecognised /repos/ path")', 'rm = REPO_PATH.match(path)'),
  ("query on writes", "server.py", 'if query and self.command not in policy.READ_METHODS and host == cfg.api_host:', 'if False:'),
  ("method override", "server.py", 'if any(h in self.headers for h in METHOD_OVERRIDE):', 'if False:'),
@@ -30,6 +29,15 @@ MUTANTS = [
  ("branch normalisation", "config.py", '        branch = normalise_branch(branch)\n', ''),
  ("string-typed fields", "policy.py", '    if v is not None and not isinstance(v, str):', '    if False:'),
  ("socket activation", "server.py", '    inherited = _systemd_socket()\n', '    inherited = None\n'),
+ ("per-uid cap", "server.py", 'if self._per_peer.get(uid, 0) >= MAX_PER_PEER:', 'if False:'),
+ ("request deadline", "server.py", '        self._deadline.start()\n', ''),
+ ("inspection slots", "server.py", '    if not _inspect_slots.acquire(timeout=INSPECT_WAIT):\n        raise Refused(503, "too many requests being inspected")', '    _inspect_slots.acquire()'),
+ ("malformed header block", "server.py", 'if self.headers.defects or self.headers.get_payload() \\', 'if False \\'),
+ ("folded header values", "server.py", '                    or any("\\r" in v or "\\n" in v for v in self.headers.values()):', '                    or False:'),
+ ("release asset refusal", "policy.py", '|releases/assets/\\d+)$")', ')$")'),
+ ("depth pre-check skips strings", "policy.py", '        if ch == \'"\':\n            i += 1', '        if False:\n            i += 1'),
+ ("classified mutations only", "config.py", 'unknown = sorted(set(mutations) - SAFE_MUTATIONS)', 'unknown = []'),
+ ("audit --denied includes errors", "cli.py", 'if a.denied and r.get("decision") not in ("deny", "error"):', 'if a.denied and r.get("decision") != "deny":'),
  ("audit escaping", "cli.py", 'return UNPRINTABLE.sub(lambda m: f"\\\\x{ord(m.group()):02x}", str(v if v is not None else ""))', 'return str(v if v is not None else "")'),
 ]
 bad = 0

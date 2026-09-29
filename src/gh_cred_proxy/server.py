@@ -25,6 +25,10 @@ from .config import Config
 MAX_INSPECT = 1 << 20          # bodies the policy reads are buffered up to this size
 MAX_REF_SECTION = 1 << 20      # receive-pack command section
 MAX_CONNECTIONS = 64
+MAX_PER_PEER = 16              # connections one uid may hold, so one client cannot starve the rest
+INSPECT_SLOTS = 4              # concurrent JSON/GraphQL parses; bounds peak memory
+INSPECT_WAIT = 30
+REQUEST_DEADLINE = 30          # whole-request budget for the request line, headers and inspected body
 CHUNK = 64 * 1024
 CLIENT_TIMEOUT = 60
 UPSTREAM_TIMEOUT = 600
@@ -36,6 +40,7 @@ HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authoriza
 STRIP_REQUEST = HOP_BY_HOP | {"host", "authorization", "cookie", "expect", "content-length"}
 STRIP_RESPONSE = HOP_BY_HOP | {"content-length", "set-cookie"}
 METHOD_OVERRIDE = ("x-http-method-override", "x-http-method", "x-method-override")
+HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")   # RFC 9110 token
 CANONICAL_PATH = re.compile(r"/[\x21-\x7e]*")
 BAD_PATH = re.compile(r"%(2e|2f|5c|00)|\\", re.I)
 
@@ -121,6 +126,20 @@ def _chunked(rfile):
             yield b
         if _read_exact(rfile, 2) != b"\r\n":
             raise Refused(400, "bad chunk terminator")
+
+
+_inspect_slots = threading.BoundedSemaphore(INSPECT_SLOTS)
+
+
+def inspect(it, limit, decide):
+    """Buffer an inspected body and decide on it, with at most INSPECT_SLOTS doing so at once."""
+    if not _inspect_slots.acquire(timeout=INSPECT_WAIT):
+        raise Refused(503, "too many requests being inspected")
+    try:
+        raw = buffer_body(it, limit)
+        return raw, decide(raw)
+    finally:
+        _inspect_slots.release()
 
 
 def buffer_body(it, limit):
@@ -251,6 +270,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def setup(self):
         super().setup()
+        # A per-recv timeout lets a client that drips bytes hold its slot forever; this bounds
+        # the whole phase before the request is authorised. Disarmed before streaming upstream.
+        self._deadline = threading.Timer(REQUEST_DEADLINE, self._expire)
+        self._deadline.daemon = True
+        self._deadline.start()
         try:
             if self.request.recv(1, socket.MSG_PEEK) == b"\x05":
                 self.socks_target = self._socks()
@@ -258,6 +282,16 @@ class Handler(BaseHTTPRequestHandler):
             self.server.proxy.audit.write({"ts": now(), "peer": self._peer(), "decision": "deny",
                                            "reason": f"socks: {getattr(e, 'reason', None) or e}"})
             raise ConnectionAbortedError("socks handshake refused")
+
+    def _expire(self):
+        try:
+            self.request.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def finish(self):
+        self._deadline.cancel()
+        super().finish()
 
     def _socks(self):
         """Minimal SOCKS5 (RFC 1928): no auth, CONNECT by domain name to a proxied host on port 80."""
@@ -338,6 +372,12 @@ class Handler(BaseHTTPRequestHandler):
                 host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]").lower()
                 path, _, query = target.partition("?")
             rec.update(host=host, path=path)
+            # The stdlib parser stops at a line it cannot read as a header and keeps the rest as
+            # "payload", silently dropping those headers. Anything left over is a malformed request.
+            if self.headers.defects or self.headers.get_payload() \
+                    or not all(HEADER_NAME.fullmatch(k) for k in self.headers.keys()) \
+                    or any("\r" in v or "\n" in v for v in self.headers.values()):
+                raise Refused(400, "malformed header block")
             if not CANONICAL_PATH.fullmatch(path) or BAD_PATH.search(path) or "//" in path \
                     or any(seg in (".", "..") for seg in path.split("/")):
                 raise Refused(400, "path is not canonical")
@@ -347,6 +387,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise Refused(400, "Host does not match the SOCKS target")
 
             if path in (IDENTITY_PATH, HEALTH_PATH):
+                self._deadline.cancel()
                 self._local(px, path)
                 rec.update(decision="local", status=200)
                 return
@@ -379,12 +420,10 @@ class Handler(BaseHTTPRequestHandler):
                 upstream = cfg.git_url
             elif host == cfg.api_host:
                 if self.command == "POST" and path == "/graphql":
-                    raw = buffer_body(body, MAX_INSPECT)
-                    d = policy.graphql_request(pol, raw)
+                    raw, d = inspect(body, MAX_INSPECT, lambda b: policy.graphql_request(pol, b))
                     body, length = iter([raw]), len(raw)
                 elif policy.rest_needs_body(self.command, path):
-                    raw = buffer_body(body, MAX_INSPECT)
-                    d = policy.rest_request(pol, self.command, path, raw)
+                    raw, d = inspect(body, MAX_INSPECT, lambda b: policy.rest_request(pol, self.command, path, b))
                     body, length = iter([raw]), len(raw)
                 else:
                     d = policy.rest_request(pol, self.command, path, None)
@@ -399,6 +438,7 @@ class Handler(BaseHTTPRequestHandler):
                 px.resolve_lookup(d)
             scope = px.scope(d.repo)
             perms = px.perms(d.access)
+            self._deadline.cancel()
             try:
                 auth = px.cred.git_authorization(scope, perms) if git else px.cred.authorization(scope, perms)
             except (credentials.UpstreamError, KeyError, ValueError) as e:
@@ -443,24 +483,55 @@ class UnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
 
     def __init__(self, *a, **kw):
         self._slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+        self._peers_lock = threading.Lock()
+        self._per_peer: dict[int, int] = {}
         super().__init__(*a, **kw)
 
+    @staticmethod
+    def _uid(request):
+        try:
+            return struct.unpack("3i", request.getsockopt(
+                socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))[1]
+        except OSError:
+            return -1
+
+    def _busy(self, request, reason):
+        try:
+            request.sendall(b"HTTP/1.1 503 Busy\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        except OSError:
+            pass
+        self.shutdown_request(request)
+        self.proxy.audit.write({"ts": now(), "decision": "deny", "status": 503, "reason": reason})
+
     def process_request(self, request, client_address):
+        uid = self._uid(request)
+        with self._peers_lock:
+            if self._per_peer.get(uid, 0) >= MAX_PER_PEER:
+                full = "too many connections from this uid"
+            else:
+                full = None
+                self._per_peer[uid] = self._per_peer.get(uid, 0) + 1
+        if full:
+            return self._busy(request, full)
         if not self._slots.acquire(blocking=False):
-            try:
-                request.sendall(b"HTTP/1.1 503 Busy\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            except OSError:
-                pass
-            self.shutdown_request(request)
-            self.proxy.audit.write({"ts": now(), "decision": "deny", "status": 503, "reason": "too many connections"})
-            return
-        super().process_request(request, client_address)
+            self._release_peer(uid)
+            return self._busy(request, "too many connections")
+        super().process_request(request, (uid,))
+
+    def _release_peer(self, uid):
+        with self._peers_lock:
+            n = self._per_peer.get(uid, 1) - 1
+            if n <= 0:
+                self._per_peer.pop(uid, None)
+            else:
+                self._per_peer[uid] = n
 
     def process_request_thread(self, request, client_address):
         try:
             super().process_request_thread(request, client_address)
         finally:
             self._slots.release()
+            self._release_peer(client_address[0])
 
     def handle_error(self, request, client_address):
         pass

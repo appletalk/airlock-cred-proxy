@@ -184,8 +184,8 @@ REST_WRITES = [(m, re.compile(p), k) for m, p, k in REST_WRITES]
 BODY_CHECKERS = {"review", "ref_create", "contents", "merges", "pr_patch", "pr_create"}
 REPO_PATH = re.compile(R + r"(/.*)?$")
 CONTENTS_PATH = re.compile(R + r"/contents/")
-# Redirects from these carry a signed download token.
-REFUSED_READS = re.compile(R + r"/(tarball|zipball)(/.*)?$")
+# Redirects from these carry a GitHub-signed download URL usable without the proxy.
+REFUSED_READS = re.compile(R + r"/((tarball|zipball)(/.*)?|releases/assets/\d+)$")
 READ_METHODS = ("GET", "HEAD")
 
 
@@ -364,13 +364,35 @@ def _input(field_node, variables):
 
 
 def _too_deep(query: str) -> bool:
+    """Cheap pre-check; brackets inside strings and comments are skipped. RecursionError is the backstop."""
     depth = peak = 0
-    for ch in query:
+    i, n = 0, len(query)
+    while i < n:
+        ch = query[i]
+        if query.startswith('"""', i):
+            end = query.find('"""', i + 3)
+            while end != -1 and query[end - 1] == "\\":
+                end = query.find('"""', end + 3)
+            if end == -1:
+                return False
+            i = end + 3
+            continue
+        if ch == '"':
+            i += 1
+            while i < n and query[i] != '"':
+                i += 2 if query[i] == "\\" else 1
+            i += 1
+            continue
+        if ch == "#":
+            nl = query.find("\n", i)
+            i = n if nl == -1 else nl + 1
+            continue
         if ch in "{([":
             depth += 1
             peak = max(peak, depth)
         elif ch in "})]":
             depth -= 1
+        i += 1
     return peak > GQL_MAX_DEPTH
 
 

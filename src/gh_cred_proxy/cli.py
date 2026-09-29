@@ -102,7 +102,7 @@ def cmd_audit(a):
                 continue
             if a.since and r.get("ts", "") < a.since:
                 continue
-            if a.denied and r.get("decision") != "deny":
+            if a.denied and r.get("decision") not in ("deny", "error"):
                 continue
             if not isinstance(r, dict):
                 continue
@@ -152,7 +152,7 @@ def main(argv=None):
 
     s = sub.add_parser("audit", help="read the audit log")
     s.add_argument("--log", required=True)
-    s.add_argument("--denied", action="store_true")
+    s.add_argument("--denied", action="store_true", help="only refused requests and errors")
     s.add_argument("--since", help="ISO timestamp, e.g. 2030-01-31T00:00:00Z")
     s.add_argument("--summary", action="store_true", help="count by decision, repo and reason")
     s.set_defaults(fn=cmd_audit)
