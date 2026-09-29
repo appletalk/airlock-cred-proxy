@@ -467,6 +467,7 @@ class Handler(BaseHTTPRequestHandler):
             scope = px.scope(d.repo)
             perms = px.perms(d.access)
             self.deadline_at = None
+            self.connection.settimeout(CLIENT_TIMEOUT)   # writes use it too; drop the residual deadline
             try:
                 auth = px.cred.git_authorization(scope, perms) if git else px.cred.authorization(scope, perms)
             except (credentials.UpstreamError, KeyError, ValueError) as e:

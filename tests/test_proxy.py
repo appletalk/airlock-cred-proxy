@@ -549,6 +549,23 @@ class ProxyTest(unittest.TestCase):
         self.assertEqual(self.api("GET", "/repos/acme/app/releases/assets/1/")[0], 400)
         self.assertEqual(self.api("GET", "/repos/acme/app/issues/")[0], 400)
 
+    def test_response_not_sent_under_residual_deadline(self):
+        seen = []
+        real = server.Proxy.forward
+
+        def spy(px, handler, *a, **kw):
+            seen.append(handler.connection.gettimeout())
+            return real(px, handler, *a, **kw)
+
+        old = server.REQUEST_DEADLINE
+        server.REQUEST_DEADLINE = 3
+        try:
+            with mock.patch.object(server.Proxy, "forward", spy):
+                self.assertEqual(self.api("GET", "/repos/acme/app")[0], 200)
+        finally:
+            server.REQUEST_DEADLINE = old
+        self.assertEqual(seen, [server.CLIENT_TIMEOUT])
+
     def test_release_asset_download_refused(self):
         self.assertEqual(self.api("GET", "/repos/acme/app/releases/assets/12",
                                   headers={"Accept": "application/octet-stream"})[0], 403)

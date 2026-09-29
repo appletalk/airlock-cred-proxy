@@ -35,6 +35,7 @@ MUTANTS = [
  ("header control characters", "server.py", '                    or any(BAD_HEADER_VALUE.search(v) for v in self.headers.values()):', '                    or False:'),
  ("encoded inspected bodies", "server.py", '                if inspected and self.headers.get("Content-Encoding"):', '                if False:'),
  ("trailing slash", "server.py", '            if host == cfg.api_host and len(path) > 1 and path.endswith("/"):', '            if False:'),
+ ("client timeout restored after authorisation", "server.py", '            self.connection.settimeout(CLIENT_TIMEOUT)   # writes use it too; drop the residual deadline\n', ''),
  ("per-uid cap", "server.py", 'if self._per_peer.get(uid, 0) >= MAX_PER_PEER:', 'if False:'),
  ("inspection slots", "server.py", '    if not _inspect_slots.acquire(timeout=INSPECT_WAIT):\n        raise Refused(503, "too many requests being inspected")', '    _inspect_slots.acquire()'),
  ("malformed header block", "server.py", 'if self.headers.defects or self.headers.get_payload() \\', 'if False \\'),
