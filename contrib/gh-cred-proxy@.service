@@ -1,0 +1,48 @@
+# One instance per identity: systemctl enable --now gh-cred-proxy@app
+# Not yet exercised under systemd; check-config and a status call after first start are the smoke test.
+# Config: /etc/gh-cred-proxy/%i.toml   Key: /etc/gh-cred-proxy/%i.key (root:root 0600)
+[Unit]
+Description=gh-cred-proxy (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gh-cred-proxy
+Group=gh-cred-proxy
+SupplementaryGroups=gh-cred-proxy-clients
+ExecStart=/opt/gh-cred-proxy/.venv/bin/gh-cred-proxy serve --config /etc/gh-cred-proxy/%i.toml
+LoadCredential=app-key:/etc/gh-cred-proxy/%i.key
+RuntimeDirectory=gh-cred-proxy
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+LogsDirectory=gh-cred-proxy
+LogsDirectoryMode=0750
+UMask=0077
+Restart=on-failure
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,32 @@
+# gh-cred-proxy example: a GitHub App identity for an agent that works on two repos.
+
+[server]
+socket = "/run/gh-cred-proxy/app.sock"      # 107-byte limit on Unix socket paths
+socket_mode = "0660"
+socket_group = "gh-cred-proxy-clients"       # accounts allowed to use this identity
+audit_log = "/var/log/gh-cred-proxy/app.jsonl"   # "-" for stderr (journald)
+# api_url = "https://api.github.com"
+# git_url = "https://github.com"
+
+[identity]
+kind = "github-app"
+app_id = 123456
+owner = "example-org"                        # the installation's account
+# installation_id = 0                        # optional; found from owner when unset
+key = { systemd_credential = "app-key" }     # or { file = "/path/key.pem" } or { command = ["pass", "show", "x"] }
+
+[policy]
+repos = ["example-org/service-a", "example-org/service-b"]
+permissions = { contents = "write", pull_requests = "write", issues = "write" }
+push_branches = ["agent/*"]
+push_tags = false
+deny_approvals = true
+merge_denied_bases = ["main"]                # merges into these are always refused
+
+[policy.repo."example-org/service-b"]
+merge_denied_bases = ["release/*"]           # added to the global list for this repo
+
+# Optional:
+# graphql_mutations = ["createPullRequest", "addComment"]     # replaces the default allowlist
+# rest_allow = [["POST", "/repos/{owner}/{repo}/check-runs"]] # extra REST writes
+# read_paths = ["/rate_limit", "/meta", "/zen", "/users/*"]   # non-repo GETs

@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gh-cred-proxy"
+version = "0.1.0"
+description = "Credential-injecting, policy-enforcing proxy between a sandboxed agent and GitHub"
+readme = "README.md"
+license = "AGPL-3.0-or-later"
+requires-python = ">=3.11"
+dependencies = [
+    "cryptography>=50.0.1",
+    "graphql-core>=3.3.0",
+]
+
+[project.scripts]
+gh-cred-proxy = "gh_cred_proxy.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

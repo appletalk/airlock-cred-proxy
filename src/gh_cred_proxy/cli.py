@@ -1,0 +1,172 @@
+"""gh-cred-proxy command line."""
+import argparse
+import collections
+import json
+import os
+import sys
+from urllib.parse import urlsplit
+
+from . import __version__, client, config, policy
+
+DEFAULT_PORT = 7391
+
+
+def _state_dir():
+    return os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "gh-cred-proxy")
+
+
+def cmd_serve(a):
+    from . import server
+    server.serve(config.load(a.config))
+
+
+def cmd_check(a):
+    cfg = config.load(a.config)
+    p = cfg.policy
+    print(f"config ok: {a.config}")
+    print(f"  identity   {cfg.kind}" + (f" app_id={cfg.app_id} owner={cfg.owner}" if cfg.kind == "github-app" else ""))
+    print(f"  socket     {cfg.socket} mode={oct(cfg.socket_mode)} group={cfg.socket_group or '-'}")
+    print(f"  hosts      api={cfg.api_host} -> {cfg.api_url}  git={cfg.git_host} -> {cfg.git_url}")
+    print(f"  repos      {', '.join(p.repos)}")
+    print(f"  perms      {', '.join(f'{k}:{v}' for k, v in sorted(p.permissions.items()))}")
+    print(f"  push       branches={p.push_branches or 'none'} tags={p.push_tags}")
+    print(f"  approvals  {'denied' if p.deny_approvals else 'allowed'}")
+    print(f"  protected  {p.merge_denied_bases or 'none'}" +
+          "".join(f"; {r}: {b}" for r, b in p.repo_merge_denied_bases.items()))
+    print(f"  mutations  {len(p.mutations)} allowed" + (" (default set)" if p.mutations == config.DEFAULT_MUTATIONS else ""))
+    if cfg.kind == "token":
+        print("  note       token identities cannot be narrowed by repo for GraphQL queries; see README")
+    if a.resolve:
+        from . import credentials
+        cred = credentials.build(cfg)
+        print(f"credential ok: {cred.identity['login']} (id {cred.identity['id']})")
+        if cfg.kind == "github-app":
+            cred.token(None, p.read_permissions())
+            print(f"  installation {cred.installation_id}; read token minted for the policy's repos")
+
+
+def cmd_explain(a):
+    cfg = config.load(a.config)
+    u = urlsplit(a.url)
+    host, path, query = (u.hostname or "").lower(), u.path or "/", u.query
+    body = None
+    if a.body:
+        body = sys.stdin.buffer.read() if a.body == "-" else open(a.body, "rb").read()
+    m = a.method.upper()
+    if host == cfg.git_host:
+        d = policy.git_request(cfg.policy, m, path, query)
+        if d.allow and path.endswith("/git-receive-pack") and a.ref:
+            d = policy.check_ref_updates(cfg.policy, d.repo, [("0" * 40, "1" * 40, r) for r in a.ref])
+    elif host == cfg.api_host:
+        d = policy.graphql_request(cfg.policy, body or b"") if (m == "POST" and path == "/graphql") \
+            else policy.rest_request(cfg.policy, m, path, body)
+    else:
+        d = policy.deny(f"host {host!r} is not proxied")
+    out = {"allow": d.allow, "reason": d.reason, "repo": d.repo, "access": d.access}
+    if d.detail:
+        out["detail"] = d.detail
+    if d.lookup:
+        out["upstream_check"] = d.lookup
+    print(json.dumps(out, indent=2))
+    return 0 if d.allow else 1
+
+
+def cmd_status(a):
+    try:
+        h = client.local_get(a.socket, "/_gh-cred-proxy/health")
+        i = client.local_get(a.socket, "/_gh-cred-proxy/identity")
+    except (OSError, RuntimeError) as e:
+        print(f"proxy unreachable at {a.socket}: {e}", file=sys.stderr)
+        return 1
+    print(f"{h['status']}: {i['login']} (id {i['id']}) api={i['api_host']} git={i['git_host']}")
+
+
+def cmd_forward(a):
+    client.forward(a.socket, a.port, a.secret_file)
+
+
+def cmd_env(a):
+    env = client.environment(a.socket, a.port, a.secret_file, a.gh_config_dir)
+    sys.stdout.write(client.shell_exports(env))
+
+
+def cmd_audit(a):
+    counts, shown = collections.Counter(), 0
+    with open(a.log) as f:
+        for line in f:
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if a.since and r.get("ts", "") < a.since:
+                continue
+            if a.denied and r.get("decision") != "deny":
+                continue
+            if a.summary:
+                counts[(r.get("decision"), r.get("repo"), r.get("reason"))] += 1
+                continue
+            print(f"{r.get('ts')} {r.get('decision', r.get('event', '?')):6} {r.get('status', ''):>3} "
+                  f"{r.get('method', ''):6} {r.get('host', '')}{r.get('path', '')} "
+                  f"{r.get('repo') or ''} :: {r.get('reason', '')}")
+            shown += 1
+    if a.summary:
+        for (dec, repo, reason), n in counts.most_common():
+            print(f"{n:6} {dec or '-':6} {repo or '-':40} {reason}")
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="gh-cred-proxy", description=__doc__)
+    ap.add_argument("--version", action="version", version=__version__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sd = _state_dir()
+
+    s = sub.add_parser("serve", help="run the proxy (normally under systemd)")
+    s.add_argument("--config", required=True)
+    s.set_defaults(fn=cmd_serve)
+
+    s = sub.add_parser("check-config", help="validate a config and print the effective policy")
+    s.add_argument("--config", required=True)
+    s.add_argument("--resolve", action="store_true", help="also load the credential and mint a read token")
+    s.set_defaults(fn=cmd_check)
+
+    s = sub.add_parser("explain", help="dry-run the policy for one request (no network)")
+    s.add_argument("--config", required=True)
+    s.add_argument("method")
+    s.add_argument("url", help="e.g. https://api.github.com/repos/o/r/pulls")
+    s.add_argument("--body", help="file with the request body, or - for stdin")
+    s.add_argument("--ref", action="append", help="for git-receive-pack: a ref being pushed (repeatable)")
+    s.set_defaults(fn=cmd_explain)
+
+    s = sub.add_parser("status", help="check a running proxy and show its identity")
+    s.add_argument("--socket", required=True)
+    s.set_defaults(fn=cmd_status)
+
+    for name, fn, hlp in (("forward", cmd_forward, "loopback TCP forwarder for git"),
+                          ("env", cmd_env, "print shell exports that route git and gh through the proxy")):
+        s = sub.add_parser(name, help=hlp)
+        s.add_argument("--socket", required=True)
+        s.add_argument("--port", type=int, default=DEFAULT_PORT)
+        s.add_argument("--secret-file", default=os.path.join(sd, "forward.secret"))
+        if name == "env":
+            s.add_argument("--gh-config-dir", default=os.path.join(sd, "gh"))
+        s.set_defaults(fn=fn)
+
+    s = sub.add_parser("audit", help="read the audit log")
+    s.add_argument("--log", required=True)
+    s.add_argument("--denied", action="store_true")
+    s.add_argument("--since", help="ISO timestamp, e.g. 2030-01-31T00:00:00Z")
+    s.add_argument("--summary", action="store_true", help="count by decision, repo and reason")
+    s.set_defaults(fn=cmd_audit)
+
+    a = ap.parse_args(argv)
+    if a.cmd in ("forward", "env"):
+        os.makedirs(os.path.dirname(a.secret_file), mode=0o700, exist_ok=True)
+    try:
+        return a.fn(a) or 0
+    except config.ConfigError as e:
+        print(f"config error: {e}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
