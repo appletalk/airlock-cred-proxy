@@ -3,12 +3,18 @@ import argparse
 import collections
 import json
 import os
+import re
 import sys
 from urllib.parse import urlsplit
 
 from . import __version__, client, config, policy
 
-DEFAULT_PORT = 7391
+UNPRINTABLE = re.compile(r"[^\x20-\x7e]")
+
+
+def _safe(v) -> str:
+    """Audit fields come from clients; never let them drive the terminal."""
+    return UNPRINTABLE.sub(lambda m: f"\\x{ord(m.group()):02x}", str(v if v is not None else ""))
 
 
 def _state_dir():
@@ -81,12 +87,8 @@ def cmd_status(a):
     print(f"{h['status']}: {i['login']} (id {i['id']}) api={i['api_host']} git={i['git_host']}")
 
 
-def cmd_forward(a):
-    client.forward(a.socket, a.port, a.secret_file)
-
-
 def cmd_env(a):
-    env = client.environment(a.socket, a.port, a.secret_file, a.gh_config_dir)
+    env = client.environment(a.socket, a.gh_config_dir)
     sys.stdout.write(client.shell_exports(env))
 
 
@@ -102,12 +104,14 @@ def cmd_audit(a):
                 continue
             if a.denied and r.get("decision") != "deny":
                 continue
-            if a.summary:
-                counts[(r.get("decision"), r.get("repo"), r.get("reason"))] += 1
+            if not isinstance(r, dict):
                 continue
-            print(f"{r.get('ts')} {r.get('decision', r.get('event', '?')):6} {r.get('status', ''):>3} "
-                  f"{r.get('method', ''):6} {r.get('host', '')}{r.get('path', '')} "
-                  f"{r.get('repo') or ''} :: {r.get('reason', '')}")
+            if a.summary:
+                counts[(_safe(r.get("decision")), _safe(r.get("repo")), _safe(r.get("reason")))] += 1
+                continue
+            print(f"{_safe(r.get('ts'))} {_safe(r.get('decision', r.get('event', '?'))):6} "
+                  f"{_safe(r.get('status')):>3} {_safe(r.get('method')):6} "
+                  f"{_safe(r.get('host'))}{_safe(r.get('path'))} {_safe(r.get('repo'))} :: {_safe(r.get('reason'))}")
             shown += 1
     if a.summary:
         for (dec, repo, reason), n in counts.most_common():
@@ -141,15 +145,10 @@ def main(argv=None):
     s.add_argument("--socket", required=True)
     s.set_defaults(fn=cmd_status)
 
-    for name, fn, hlp in (("forward", cmd_forward, "loopback TCP forwarder for git"),
-                          ("env", cmd_env, "print shell exports that route git and gh through the proxy")):
-        s = sub.add_parser(name, help=hlp)
-        s.add_argument("--socket", required=True)
-        s.add_argument("--port", type=int, default=DEFAULT_PORT)
-        s.add_argument("--secret-file", default=os.path.join(sd, "forward.secret"))
-        if name == "env":
-            s.add_argument("--gh-config-dir", default=os.path.join(sd, "gh"))
-        s.set_defaults(fn=fn)
+    s = sub.add_parser("env", help="print shell exports that route git and gh through the proxy")
+    s.add_argument("--socket", required=True)
+    s.add_argument("--gh-config-dir", default=os.path.join(sd, "gh"))
+    s.set_defaults(fn=cmd_env)
 
     s = sub.add_parser("audit", help="read the audit log")
     s.add_argument("--log", required=True)
@@ -159,8 +158,6 @@ def main(argv=None):
     s.set_defaults(fn=cmd_audit)
 
     a = ap.parse_args(argv)
-    if a.cmd in ("forward", "env"):
-        os.makedirs(os.path.dirname(a.secret_file), mode=0o700, exist_ok=True)
     try:
         return a.fn(a) or 0
     except config.ConfigError as e:

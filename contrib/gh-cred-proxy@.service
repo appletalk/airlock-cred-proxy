@@ -1,25 +1,24 @@
-# One instance per identity: systemctl enable --now gh-cred-proxy@app
-# Not yet exercised under systemd; check-config and a status call after first start are the smoke test.
-# Config: /etc/gh-cred-proxy/%i.toml   Key: /etc/gh-cred-proxy/%i.key (root:root 0600)
+# One instance per identity, started by gh-cred-proxy@<name>.socket.
+# Config: /etc/gh-cred-proxy/%i.toml (root:gh-cred-proxy 0640)
+# Key:    /etc/gh-cred-proxy/%i.key  (root:root 0600, read by systemd, handed over via LoadCredential)
 [Unit]
 Description=gh-cred-proxy (%i)
-After=network-online.target
+Requires=gh-cred-proxy@%i.socket
+After=gh-cred-proxy@%i.socket network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=gh-cred-proxy
 Group=gh-cred-proxy
-SupplementaryGroups=gh-cred-proxy-clients
 ExecStart=/opt/gh-cred-proxy/.venv/bin/gh-cred-proxy serve --config /etc/gh-cred-proxy/%i.toml
 LoadCredential=app-key:/etc/gh-cred-proxy/%i.key
-RuntimeDirectory=gh-cred-proxy
-RuntimeDirectoryMode=0750
-RuntimeDirectoryPreserve=yes
 LogsDirectory=gh-cred-proxy
 LogsDirectoryMode=0750
 UMask=0077
 Restart=on-failure
+MemoryMax=512M
+TasksMax=128
 
 NoNewPrivileges=yes
 ProtectSystem=strict

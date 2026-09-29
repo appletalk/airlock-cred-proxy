@@ -1,3 +1,4 @@
+import time
 import unittest
 
 from gh_cred_proxy import config, policy
@@ -86,7 +87,75 @@ class Rest(unittest.TestCase):
         self.assertFalse(policy.rest_request(pol(), "POST", "/repos/acme/app/check-runs", None).allow)
 
 
+class ReviewRound1(unittest.TestCase):
+    def test_percent_encoded_owner_cannot_reach_rest_allow(self):
+        p = pol(rest_allow=[["POST", "/repos/{owner}/{repo}/check-runs"]])
+        self.assertFalse(policy.rest_request(p, "POST", "/repos/%65vil/secret/check-runs", None).allow)
+        self.assertFalse(policy.rest_request(p, "POST", "/repos/evil/secret/check-runs", None).allow)
+        self.assertTrue(policy.rest_request(p, "POST", "/repos/acme/app/check-runs", None).allow)
+
+    def test_percent_allowed_only_in_contents_path(self):
+        p = pol()
+        self.assertTrue(policy.rest_request(p, "GET", "/repos/acme/app/contents/a%20b.txt", None).allow)
+        self.assertFalse(policy.rest_request(p, "GET", "/repos/acme/app/issues%3fx", None).allow)
+
+    def test_parser_is_linear_on_one_byte_feeds(self):
+        line = pkt(f"{OLD} {NEW} refs/heads/agent/{'x' * 100}".encode())
+        data = line * 1500 + b"0000"
+        parser = policy.RefCommandParser(len(data) + 1)
+        t0 = time.monotonic()
+        out = None
+        for i in range(len(data)):
+            out = parser.feed(data[i:i + 1])
+            if out is not None:
+                break
+        self.assertEqual(len(out), 1500)
+        self.assertLess(time.monotonic() - t0, 5)
+
+    def test_parser_refuses_oversized_section(self):
+        parser = policy.RefCommandParser(1000)
+        with self.assertRaises(ValueError):
+            parser.feed(pkt(f"{OLD} {NEW} refs/heads/agent/x".encode()) * 50)
+
+    def test_fully_qualified_branch_names_normalised(self):
+        p = pol(push_branches=["*"])
+        self.assertFalse(policy.rest_request(p, "PUT", "/repos/acme/app/contents/a",
+                                             b'{"branch":"refs/heads/main"}').allow)
+        self.assertFalse(policy.rest_request(p, "POST", "/repos/acme/app/merges",
+                                             b'{"base":"refs/heads/main","head":"x"}').allow)
+        self.assertFalse(policy.rest_request(p, "PATCH", "/repos/acme/app/pulls/1",
+                                             b'{"base":"refs/heads/main"}').allow)
+        self.assertFalse(policy.rest_request(p, "DELETE", "/repos/acme/app/git/refs/heads/refs/heads/main",
+                                             None).allow)
+
+    def test_fully_qualified_allowed_branch_accepted(self):
+        p = pol()
+        self.assertTrue(policy.rest_request(p, "PUT", "/repos/acme/app/contents/a",
+                                            b'{"branch":"refs/heads/agent/x"}').allow)
+
+    def test_non_string_fields_refused(self):
+        p = pol()
+        self.assertFalse(policy.rest_request(p, "PATCH", "/repos/acme/app/pulls/1", b'{"base":["main"]}').allow)
+        self.assertFalse(policy.rest_request(p, "POST", "/repos/acme/app/pulls/1/reviews",
+                                             b'{"event":["APPROVE"]}').allow)
+
+
 class Config(unittest.TestCase):
+    def test_never_mutations_cannot_be_enabled(self):
+        for m in ("enablePullRequestAutoMerge", "createCommitOnBranch", "updateRefs", "enqueuePullRequest"):
+            with self.assertRaises(config.ConfigError, msg=m):
+                pol(graphql_mutations=["createPullRequest", m])
+
+    def test_world_accessible_socket_refused(self):
+        with self.assertRaises(config.ConfigError):
+            config.parse({"server": {"socket": "/tmp/s", "socket_mode": "0666"},
+                          "identity": {"kind": "token", "token": {"command": ["true"]}},
+                          "policy": {"repos": ["*"]}})
+
+    def test_repo_outside_app_owner_refused(self):
+        with self.assertRaises(config.ConfigError):
+            pol(repos=["acme/app", "other/app"])
+
     def test_repos_required(self):
         with self.assertRaises(config.ConfigError):
             pol(repos=[])

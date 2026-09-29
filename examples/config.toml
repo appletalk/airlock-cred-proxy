@@ -3,7 +3,7 @@
 [server]
 socket = "/run/gh-cred-proxy/app.sock"      # 107-byte limit on Unix socket paths
 socket_mode = "0660"
-socket_group = "gh-cred-proxy-clients"       # accounts allowed to use this identity
+socket_group = "gh-cred-proxy-clients"       # only when not socket-activated (contrib/ units set it there)
 audit_log = "/var/log/gh-cred-proxy/app.jsonl"   # "-" for stderr (journald)
 # api_url = "https://api.github.com"
 # git_url = "https://github.com"

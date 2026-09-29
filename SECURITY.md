@@ -19,33 +19,43 @@ branches, open and update pull requests and issues. It must not be able to:
 | Proxy process | The App private key or the fronted token | The agent, and ideally the operator's everyday account |
 | Proxy config | Policy | The agent |
 | Proxy code | Enforcement | The agent; run an installed copy, not a working tree |
-| Forwarder, `env` | The forwarder secret | Other local users |
+| The socket | Use of the identity | Accounts outside its group |
 | The agent | Nothing | - |
 
 Run the proxy as a dedicated system user, with the key delivered by systemd
 `LoadCredential=` (or `LoadCredentialEncrypted=`), and the socket group-restricted to the
-accounts that may use it. `contrib/gh-cred-proxy@.service` does this.
+accounts that may use it. The units in `contrib/` do this. Nothing listens on TCP: git
+reaches the socket as a SOCKS5 proxy.
 
 ## Design choices
 
-- **Fail closed.** Unknown endpoints, unparseable bodies, unresolvable variables,
-  failed upstream lookups and anything larger than the inspection limit are refused.
+- **Fail closed.** Unknown endpoints, unparseable bodies, unresolvable or undeclared
+  variables, failed upstream lookups and anything larger than the inspection limit are
+  refused. An unexpected exception is refused with a 500 and recorded as `error`.
 - **Parse like the server does.** Bodies the policy reads are parsed once and forwarded
   byte-for-byte. Duplicate JSON keys are refused so the proxy and GitHub cannot read
   different values. Requests with both `Content-Length` and `Transfer-Encoding` are
   refused.
 - **Check the real state.** Merge decisions use the base branch GitHub reports for the
-  PR, not what the request claims.
+  PR, not what the request claims. Anything that moves a ref, a PR's base or merges goes
+  through a checker; mutations with no possible checker cannot be enabled.
 - **Mint narrow.** Each token covers one repo (or the allowlist, for GraphQL) and only
   the access the request needs.
 - **Log decisions, not secrets.** The audit log never contains tokens or bodies.
 
 ## Known limits
 
-- A `token` identity cannot be narrowed at mint time. GraphQL queries through it can
-  read anything the token can.
-- The loopback forwarder authenticates the first request on each connection. Anyone
-  who can read the forwarder secret file (mode 0600) can use the identity.
+- A `token` identity cannot be narrowed at mint time. GraphQL queries and allowed
+  mutations through it reach any repo the token can.
+- Check, then act. A merge is checked against the PR's base at request time; a
+  retarget that lands between the check and GitHub acting on the merge is not caught.
+  Retargeting onto a protected base is itself refused, so this needs a second actor.
+  GitHub branch protection on those branches is the backstop.
+- Responses are passed through. Some GitHub responses carry short-lived signed URLs
+  (contents `download_url` for private repos) that work without the proxy until they
+  expire. They are read-only and cover repos the agent can already read. Archive
+  downloads, whose redirects carry such URLs, are refused.
+- Anyone in the socket's group can use the identity.
 - Allowed branches are only as safe as the branch protection behind them. The proxy
   keeps the agent off protected branches. It does not replace GitHub rulesets, which
   should still require reviews on those branches.

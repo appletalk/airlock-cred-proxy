@@ -1,4 +1,4 @@
-"""End-to-end: real proxy, real forwarder, real git, fake GitHub."""
+"""End-to-end: real proxy, real git over SOCKS5 on the socket, fake GitHub."""
 import base64
 import json
 import os
@@ -62,18 +62,11 @@ class ProxyTest(unittest.TestCase):
         cls.srv = server.bind(cls.cfg, server.Proxy(cls.cfg, cred, audit))
         threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
 
-        cls.port = free_port()
-        cls.secret_file = os.path.join(cls.tmp, "fwd.secret")
-        fs = client.ForwardServer(("127.0.0.1", cls.port), client._Forward)
-        fs.sock_path, fs.secret = cls.sock, client.read_or_create_secret(cls.secret_file)
-        cls.fwd = fs
-        threading.Thread(target=fs.serve_forever, daemon=True).start()
-        cls.env = client.environment(cls.sock, cls.port, cls.secret_file, os.path.join(cls.tmp, "gh"))
+        cls.env = client.environment(cls.sock, os.path.join(cls.tmp, "gh"))
 
     @classmethod
     def tearDownClass(cls):
         cls.srv.shutdown()
-        cls.fwd.shutdown()
         cls.fake.shutdown()
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
@@ -212,6 +205,11 @@ class ProxyTest(unittest.TestCase):
         status, _ = self.gql(q)
         self.assertEqual(status, 403)
 
+    def test_graphql_non_approval_default_allowed(self):
+        q = ("mutation($e: PullRequestReviewEvent = COMMENT) "
+             "{ addPullRequestReview(input:{pullRequestId:\"P\", event:$e}) { clientMutationId } }")
+        self.assertEqual(self.gql(q)[0], 200)
+
     def test_graphql_approval_via_aliased_variable_input_refused(self):
         q = "mutation($i: AddPullRequestReviewInput!) { ok: addPullRequestReview(input:$i) { clientMutationId } }"
         status, _ = self.gql(q, {"i": {"pullRequestId": "P", "event": "approve"}})
@@ -231,7 +229,7 @@ class ProxyTest(unittest.TestCase):
         raw = b'{"query": "mutation { deleteRepository(input:{}) { x } }", "query": "query { viewer { login } }"}'
         self.assertEqual(self.api("POST", "/graphql", raw)[0], 403)
 
-    # ------------------------------------------------------------ git through the forwarder
+    # ------------------------------------------------------------ git over SOCKS5
 
     def clone(self):
         d = tempfile.mkdtemp(dir=self.tmp)
@@ -251,6 +249,9 @@ class ProxyTest(unittest.TestCase):
         tok = base64.b64decode(push_auth[6:]).decode().split(":", 1)[1]
         self.assertEqual(self.fake.state.tokens[tok]["permissions"]["contents"], "write")
         self.assertEqual(self.fake.state.tokens[tok]["repositories"], ["app"])
+        with open(self.audit_path) as f:
+            pushes = [json.loads(l) for l in f if "git-receive-pack" in l]
+        self.assertTrue(pushes and all(r.get("socks") for r in pushes if r.get("method") == "POST"))
 
     def test_git_push_to_main_and_tags_refused(self):
         d = self.clone()
@@ -274,14 +275,135 @@ class ProxyTest(unittest.TestCase):
         refs = self.git(bare, "for-each-ref", "--format=%(refname)").stdout.split()
         self.assertNotIn("refs/heads/agent/ok2", refs)
 
-    def test_forwarder_requires_secret(self):
-        bad = dict(self.env)
-        for k, v in list(bad.items()):
-            if v.startswith("http://agent:"):
-                bad[k] = f"http://agent:wrong@127.0.0.1:{self.port}"
-        d = tempfile.mkdtemp(dir=self.tmp)
-        r = self.git(self.tmp, "clone", "-q", "https://github.com/acme/app.git", d, env=bad, check=False)
-        self.assertNotEqual(r.returncode, 0)
+    def socks(self, host, port=80):
+        c = socket.socket(socket.AF_UNIX)
+        c.connect(self.sock)
+        c.sendall(b"\x05\x01\x00")
+        self.assertEqual(c.recv(2), b"\x05\x00")
+        h = host.encode()
+        c.sendall(b"\x05\x01\x00\x03" + bytes([len(h)]) + h + port.to_bytes(2, "big"))
+        return c, c.recv(10)
+
+    def test_socks_refuses_other_hosts_and_tls_port(self):
+        for host, port in (("evil.example", 80), ("github.com", 443)):
+            c, rep = self.socks(host, port)
+            self.assertNotEqual(rep[1], 0, (host, port))
+            c.close()
+
+    def test_socks_host_header_must_match_target(self):
+        c, rep = self.socks("github.com")
+        self.assertEqual(rep[1], 0)
+        c.sendall(b"GET /repos/acme/app HTTP/1.1\r\nHost: api.github.com\r\n\r\n")
+        self.assertTrue(c.recv(4096).startswith(b"HTTP/1.1 400"))
+        c.close()
+
+    # ------------------------------------------------------------ review round 1 regressions
+
+    def test_graphql_retarget_to_protected_base_refused(self):
+        self.fake.state.nodes["PR_x"] = {"baseRefName": "agent/x", "nameWithOwner": "acme/app"}
+        q = "mutation($id: ID!, $b: String!) { updatePullRequest(input:{pullRequestId:$id, baseRefName:$b}) { clientMutationId } }"
+        self.assertEqual(self.gql(q, {"id": "PR_x", "b": "main"})[0], 403)
+        self.assertEqual(self.gql(q, {"id": "PR_x", "b": "refs/heads/main"})[0], 403)
+        self.assertEqual(self.gql(q, {"id": "PR_x", "b": "agent/y"})[0], 200)
+        q2 = "mutation { updatePullRequest(input:{pullRequestId:\"PR_x\", title:\"t\"}) { clientMutationId } }"
+        self.assertEqual(self.gql(q2)[0], 200)
+
+    def test_graphql_auto_merge_refused(self):
+        q = "mutation { enablePullRequestAutoMerge(input:{pullRequestId:\"PR_x\"}) { clientMutationId } }"
+        self.assertEqual(self.gql(q)[0], 403)
+
+    def test_graphql_duplicate_fields_and_undeclared_variables_refused(self):
+        q = "mutation { addPullRequestReview(input:{pullRequestId:\"P\", event:APPROVE, event:COMMENT}) { clientMutationId } }"
+        self.assertEqual(self.gql(q)[0], 403)
+        q = "mutation { addPullRequestReview(input:{pullRequestId:\"P\", event:$e}) { clientMutationId } }"
+        self.assertEqual(self.gql(q, {"e": "APPROVE"})[0], 403)
+        self.assertEqual(self.gql(q, {"e": "COMMENT"})[0], 403)
+
+    def test_graphql_deep_nesting_refused_cleanly(self):
+        status, body = self.gql("query {" + "a{" * 3000 + "b" + "}" * 3000 + "}")
+        self.assertEqual(status, 403, body[:200])
+
+    def test_graphql_lookup_null_data_refused(self):
+        q = "mutation($id: ID!) { mergePullRequest(input:{pullRequestId:$id}) { clientMutationId } }"
+        self.fake.state.nodes_null = True
+        try:
+            self.assertEqual(self.gql(q, {"id": "PR_main"})[0], 403)
+        finally:
+            self.fake.state.nodes_null = False
+
+    def test_query_string_and_method_override_on_writes_refused(self):
+        self.assertEqual(self.api("POST", "/repos/acme/app/pulls/1/reviews?event=APPROVE", {})[0], 400)
+        self.assertEqual(self.api("POST", "/repos/acme/app/issues", {"title": "t"},
+                                  headers={"X-HTTP-Method-Override": "DELETE"})[0], 400)
+        self.assertEqual(self.api("GET", "/repos/acme/app/pulls?state=open")[0], 200)
+
+    def test_archive_downloads_refused(self):
+        self.assertEqual(self.api("GET", "/repos/acme/app/tarball/main")[0], 403)
+        self.assertEqual(self.api("GET", "/repos/acme/app/zipball")[0], 403)
+
+    def raw(self, data, read=True):
+        c = socket.socket(socket.AF_UNIX)
+        c.connect(self.sock)
+        c.sendall(data)
+        out = b""
+        if read:
+            c.settimeout(10)
+            try:
+                while chunk := c.recv(65536):
+                    out += chunk
+            except (ConnectionResetError, BrokenPipeError):
+                pass
+        c.close()
+        return out
+
+    def test_malformed_framing_answered(self):
+        for req in (
+            "POST /graphql HTTP/1.1\r\nHost: api.github.com\r\nContent-Length: \u00b2\r\n\r\n".encode("utf-8"),
+            b"POST /graphql HTTP/1.1\r\nHost: api.github.com\r\nTransfer-Encoding: chunked\r\n\r\n7fffffffffffffff\r\n",
+            b"GET /repos/acme/app/\xc2\x9b HTTP/1.1\r\nHost: api.github.com\r\n\r\n",
+        ):
+            resp = self.raw(req)
+            self.assertTrue(resp.startswith(b"HTTP/1.1 4"), (req[:60], resp[:80]))
+
+    def test_oversized_chunk_refused_without_buffering_it(self):
+        c = socket.socket(socket.AF_UNIX)
+        c.connect(self.sock)
+        c.sendall(b"POST /graphql HTTP/1.1\r\nHost: api.github.com\r\nTransfer-Encoding: chunked\r\n\r\n"
+                  b"8000000\r\n")
+        c.settimeout(10)
+        sent = 0
+        try:
+            while sent < 4 << 20:
+                c.sendall(b"x" * 65536)
+                sent += 65536
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        resp = b""
+        try:
+            resp = c.recv(4096)
+        except OSError:
+            pass
+        c.close()
+        self.assertTrue(resp.startswith(b"HTTP/1.1 413"), resp[:80])
+
+    def test_connection_cap_answers_busy(self):
+        held = []
+        try:
+            for _ in range(server.MAX_CONNECTIONS):
+                c = socket.socket(socket.AF_UNIX)
+                c.connect(self.sock)
+                held.append(c)
+            time.sleep(0.3)
+            extra = socket.socket(socket.AF_UNIX)
+            extra.connect(self.sock)
+            extra.settimeout(5)
+            self.assertTrue(extra.recv(64).startswith(b"HTTP/1.1 503"))
+            extra.close()
+        finally:
+            for c in held:
+                c.close()
+        time.sleep(0.3)
+        self.assertEqual(self.api("GET", "/repos/acme/app")[0], 200)
 
     def test_audit_log_has_no_tokens(self):
         self.api("GET", "/repos/acme/app/issues")

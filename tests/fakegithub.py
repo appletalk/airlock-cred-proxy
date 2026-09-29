@@ -92,6 +92,8 @@ class Handler(BaseHTTPRequestHandler):
                                     "head": {"ref": p["head"], "repo": {"full_name": p.get("head_repo", m[1])}}})
         if path == "/graphql":
             q = json.loads(body)
+            if "nodes(ids:" in q["query"] and getattr(st, "nodes_null", False):
+                return self._json(200, {"data": None})
             if "nodes(ids:" in q["query"]:
                 nodes = []
                 for i in q["variables"]["ids"]:

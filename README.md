@@ -21,10 +21,11 @@ what the agent may reach, and log everything.
 | Repo allowlist | Requests for repos outside `policy.repos` are refused before anything reaches GitHub. |
 | Branch pushes | `git push`, ref API writes, contents API writes and merges-into-branch only reach branches matching `push_branches`. Tags are refused unless `push_tags = true`. A push that mixes allowed and refused refs is refused whole. |
 | No approvals | Approving reviews are refused over REST and GraphQL, including through variables, variable defaults and aliases. The agent cannot approve its own or anyone else's pull request. |
-| Protected bases | Merging a PR into a `merge_denied_bases` branch is refused. The proxy looks up the PR's real base on GitHub instead of trusting the request. Retargeting a PR onto a protected base is refused. |
+| Protected bases | Merging a PR into a `merge_denied_bases` branch is refused. The proxy looks up the PR's real base on GitHub instead of trusting the request. Retargeting a PR onto a protected base is refused over REST and GraphQL. Auto-merge and the merge queue cannot be enabled, because they act after the check. |
 | REST writes | Only a fixed set of pull-request, issue and branch endpoints. Everything else is refused unless listed in `rest_allow`. |
-| GraphQL | Parsed with `graphql-core`. Queries pass. Mutations must be in the allowlist. Subscriptions, top-level fragments in mutations and duplicate JSON keys are refused. |
-| Request hygiene | Non-canonical paths (`..`, `//`, encoded `/` or `.`), ambiguous body framing and unknown hosts are refused. |
+| GraphQL | Parsed with `graphql-core`. Queries pass. Mutations must be in the allowlist, and mutations that move refs without a check here (`createCommitOnBranch`, `updateRefs` and similar) cannot be added to it. Subscriptions, top-level fragments in mutations, duplicate fields or JSON keys, undeclared variables and deeply nested documents are refused. |
+| Request hygiene | Non-ASCII or non-canonical paths, `%` outside a contents file path, query strings and method-override headers on writes, ambiguous body framing and unknown hosts are refused. Archive downloads are refused because their redirects carry a signed token. |
+| Resource limits | Inspected bodies are capped at 1 MiB and read in pieces, the push command section is parsed incrementally, and concurrent connections are capped. |
 | Audit | One JSON line per request: time, peer pid and uid, method, host, path, repo, decision, reason, status, bytes. Never tokens or bodies. |
 
 Anything the proxy cannot classify is refused.
@@ -33,12 +34,17 @@ Anything the proxy cannot classify is refused.
 
 - **`gh`** has an `http_unix_socket` setting and speaks plain HTTP over it, so it talks
   to the proxy directly. It needs a placeholder `GH_TOKEN` to start; the proxy discards it.
-- **`git`** cannot use a Unix socket. `gh-cred-proxy forward` listens on `127.0.0.1` and
-  relays to the socket. Git reaches it as an HTTP proxy for `http://github.com/` URLs.
-  Each connection must present a secret, so other local users cannot borrow the identity.
+- **`git`** reaches the same socket as a SOCKS5 proxy
+  (`http.proxy=socks5h://localhost/<socket>`; needs a curl that supports SOCKS over a
+  Unix socket, tested with curl 8.22). It
+  connects to `github.com:80` through the proxy and sends plain HTTP, which the proxy
+  inspects like any other request.
 - **`gh-cred-proxy env`** prints the environment for one shell: URL rewrites from
-  `https://`, `git@` and `ssh://` to the proxy, the proxy address, an empty credential
-  helper, the `gh` settings, and the bot's git author and committer identity.
+  `https://`, `git@` and `ssh://` to plain `http://github.com/`, the SOCKS proxy for that
+  URL, an empty credential helper, the `gh` settings, and the bot's git author and
+  committer identity.
+
+Access control is the socket's file permissions. Nothing listens on TCP.
 
 Nothing is written to any repository's `.git/config`. Remotes keep their normal
 `git@github.com:` or `https://` URLs, so the same checkout still works outside the
@@ -54,8 +60,9 @@ python3 -m venv .venv
 .venv/bin/pip install --no-deps .
 ```
 
-Run the service from an installed copy owned by its own user, never from a working tree
-that the agent or your everyday account can edit. See `contrib/`.
+Run the service from an installed copy owned by root, never from a working tree that the
+agent or your everyday account can edit. `contrib/` has a socket unit and a hardened
+service unit; systemd creates the socket with the right group and mode.
 
 ## Configure
 
@@ -76,7 +83,6 @@ network calls, so checks that need GitHub (a PR's real base) show as `upstream_c
 ```
 gh-cred-proxy serve --config /etc/gh-cred-proxy/app.toml                   # the service
 gh-cred-proxy status --socket /run/gh-cred-proxy/app.sock                  # health and identity
-gh-cred-proxy forward --socket /run/gh-cred-proxy/app.sock                 # per client, for git
 eval "$(gh-cred-proxy env --socket /run/gh-cred-proxy/app.sock)"           # per shell
 gh-cred-proxy audit --log /var/log/gh-cred-proxy/app.jsonl --denied        # what was refused, and why
 gh-cred-proxy audit --log /var/log/gh-cred-proxy/app.jsonl --summary
@@ -91,9 +97,9 @@ error bodies for push requests. The reason is in the audit log.
   scoped by repo and permission. With `deny_approvals` on, the App cannot approve anything.
 - `kind = "token"`: fronts an existing token, for example a person's session token, so
   an agent can use a narrow slice of it without holding it. The token cannot be narrowed
-  at mint time, so the policy is the only control, and GraphQL queries cannot be limited
-  by repo. Use a tight `graphql_mutations` list, and prefer a GitHub App wherever one can
-  do the job.
+  at mint time, so the policy is the only control. GraphQL queries and mutations are not
+  limited by repo: an allowed mutation works on any repo the token reaches. Use a tight
+  `graphql_mutations` list, and prefer a GitHub App wherever one can do the job.
 
 One identity per proxy instance. Run one instance per identity, each with its own socket.
 
@@ -101,7 +107,7 @@ One identity per proxy instance. Run one instance per identity, each with its ow
 
 The proxy is the only component that holds the key. It can run on a shared host, with
 each operator reaching it over a socket or an authenticated tunnel, so the key exists in
-one place instead of on every workstation. The forwarder and `env` stay local to each
+one place instead of on every workstation. `env` and the socket mount stay local to each
 client.
 
 ## Test
@@ -111,7 +117,7 @@ client.
 .venv/bin/python tests/mutate.py        # each protection, broken on purpose, must fail a test
 ```
 
-The end-to-end tests run the real proxy and forwarder with real `git` against a fake
+The end-to-end tests run the real proxy with real `git` over SOCKS5 against a fake
 GitHub backed by `git http-backend`.
 
 ## Licence

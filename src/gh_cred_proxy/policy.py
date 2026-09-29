@@ -1,4 +1,9 @@
-"""Request classification and allow/deny decisions. Everything unrecognised is denied."""
+"""Request classification and allow/deny decisions. Everything unrecognised is denied.
+
+Two rules govern every checker here:
+- anything that can move a ref, change a pull request's base, or merge goes through a checker;
+- input the proxy cannot read exactly as GitHub will is refused, not guessed at.
+"""
 import json
 import re
 from dataclasses import dataclass, field
@@ -7,11 +12,12 @@ from graphql import parse as gql_parse
 from graphql.error import GraphQLError
 from graphql.language import ast as gast
 
-from .config import Policy
+from .config import Policy, normalise_branch
 
-ZERO = "0" * 40
 _OWNER = r"(?P<owner>[A-Za-z0-9_.-]+)"
 _REPO = r"(?P<repo>[A-Za-z0-9_.-]+?)"
+GQL_MAX_TOKENS = 20000
+GQL_MAX_DEPTH = 64
 
 
 @dataclass
@@ -36,6 +42,7 @@ def allow(reason, **kw):
 # https://git-scm.com/docs/http-protocol
 
 GIT_PATH = re.compile(rf"^/{_OWNER}/{_REPO}(?:\.git)?/(?P<svc>info/refs|git-upload-pack|git-receive-pack)$")
+OID = re.compile(rb"[0-9a-f]{40}|[0-9a-f]{64}")
 
 
 def git_request(policy: Policy, method: str, path: str, query: str) -> Decision:
@@ -54,53 +61,84 @@ def git_request(policy: Policy, method: str, path: str, query: str) -> Decision:
         if query == "service=git-receive-pack":
             return allow("push advertisement", repo=repo, access="write")
         return deny("dumb HTTP or unknown service", repo=repo)
-    if method != "POST":
-        return deny(f"{svc} must be POST", repo=repo)
+    if method != "POST" or query:
+        return deny(f"{svc} must be a POST without a query string", repo=repo)
     if svc == "git-upload-pack":
         return allow("fetch", repo=repo)
     return allow("push; ref updates checked separately", repo=repo, access="write")
 
 
-def parse_ref_updates(data: bytes) -> list[tuple[str, str, str]] | None:
-    """Parse the command section of a receive-pack request.
+class RefCommandParser:
+    """Incremental parser for the command section of a receive-pack request.
 
-    Returns [(old, new, ref)] once a flush-pkt has been seen, None if more data is needed.
-    Raises ValueError on anything malformed.
+    feed() returns [(old, new, ref)] once the flush-pkt arrives, None while more is needed,
+    and raises ValueError on anything malformed. Each byte is examined once.
     """
-    out, pos = [], 0
-    while True:
-        if len(data) - pos < 4:
-            return None
-        n = int(data[pos:pos + 4], 16)
-        if n == 0:
-            return out
-        if n < 4:
-            raise ValueError("reserved pkt-line length")
-        if len(data) - pos < n:
-            return None
-        line = data[pos + 4:pos + n].split(b"\0", 1)[0].rstrip(b"\n").decode("utf-8")
-        pos += n
-        if line.startswith("shallow "):
-            continue
-        if line.startswith("push-cert"):
+
+    def __init__(self, limit: int):
+        self.buf = bytearray()
+        self.pos = 0
+        self.limit = limit
+        self.out = []
+
+    def feed(self, data: bytes):
+        self.buf += data
+        while True:
+            if len(self.buf) - self.pos < 4:
+                break
+            head = bytes(self.buf[self.pos:self.pos + 4])
+            if not re.fullmatch(rb"[0-9a-f]{4}", head):
+                raise ValueError("bad pkt-line length")
+            n = int(head, 16)
+            if n == 0:
+                return self.out
+            if n < 4:
+                raise ValueError("reserved pkt-line length")
+            if len(self.buf) - self.pos < n:
+                break
+            self._line(bytes(self.buf[self.pos + 4:self.pos + n]))
+            self.pos += n
+        if len(self.buf) > self.limit:
+            raise ValueError("command section too large")
+        return None
+
+    def _line(self, raw: bytes):
+        line = raw.split(b"\0", 1)[0].rstrip(b"\n")
+        if line.startswith(b"shallow "):
+            return
+        if line.startswith(b"push-cert"):
             raise ValueError("signed pushes are not supported")
-        parts = line.split(" ")
-        if len(parts) != 3 or not all(re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", p) for p in parts[:2]):
+        parts = line.split(b" ")
+        if len(parts) != 3 or not (OID.fullmatch(parts[0]) and OID.fullmatch(parts[1])):
             raise ValueError(f"unexpected command line {line[:80]!r}")
-        out.append((parts[0], parts[1], parts[2]))
+        try:
+            ref = parts[2].decode("ascii")
+        except UnicodeDecodeError:
+            raise ValueError("non-ASCII ref name")
+        self.out.append((parts[0].decode(), parts[1].decode(), ref))
+
+    @property
+    def consumed(self) -> bytes:
+        return bytes(self.buf)
+
+
+def parse_ref_updates(data: bytes):
+    """One-shot form of RefCommandParser, for tests and the CLI."""
+    return RefCommandParser(len(data) + 1).feed(data)
 
 
 def check_ref_updates(policy: Policy, repo: str, updates) -> Decision:
+    # An empty list is git's four-byte probe before a large push; it updates nothing.
     for old, new, ref in updates:
         if ref.startswith("refs/heads/"):
             branch = ref[len("refs/heads/"):]
             if not policy.branch_pushable(branch):
-                return deny(f"push to branch {branch!r} not allowed", repo=repo)
+                return deny(f"push to branch {branch!r} not allowed", repo=repo, access="write")
         elif ref.startswith("refs/tags/"):
             if not policy.push_tags:
-                return deny(f"tag push {ref!r} not allowed", repo=repo)
+                return deny(f"tag push {ref!r} not allowed", repo=repo, access="write")
         else:
-            return deny(f"push to {ref!r} not allowed", repo=repo)
+            return deny(f"push to {ref!r} not allowed", repo=repo, access="write")
     return allow("ref updates allowed", repo=repo, access="write",
                  detail={"refs": [f"{'delete' if set(n) == {'0'} else 'update'} {r}" for _, n, r in updates]})
 
@@ -108,10 +146,11 @@ def check_ref_updates(policy: Policy, repo: str, updates) -> Decision:
 # ---------------------------------------------------------------- REST
 # Write endpoints a pull-request and issue workflow needs. Each maps to a checker.
 
-R = rf"^/repos/{_OWNER}/(?P<repo>[A-Za-z0-9_.-]+)"
+_NAME = r"[A-Za-z0-9_.-]+"
+R = rf"^/repos/(?P<owner>{_NAME})/(?P<repo>{_NAME})"
 N = r"(?P<num>\d+)"
 REST_WRITES = [
-    ("POST", R + r"/pulls$", "plain"),
+    ("POST", R + r"/pulls$", "pr_create"),
     ("PATCH", R + rf"/pulls/{N}$", "pr_patch"),
     ("PUT", R + rf"/pulls/{N}/merge$", "merge"),
     ("PUT", R + rf"/pulls/{N}/update-branch$", "update_branch"),
@@ -142,13 +181,17 @@ REST_WRITES = [
     ("POST", R + r"/merges$", "merges"),
 ]
 REST_WRITES = [(m, re.compile(p), k) for m, p, k in REST_WRITES]
+BODY_CHECKERS = {"review", "ref_create", "contents", "merges", "pr_patch", "pr_create"}
 REPO_PATH = re.compile(R + r"(/.*)?$")
+CONTENTS_PATH = re.compile(R + r"/contents/")
+# Redirects from these carry a signed download token.
+REFUSED_READS = re.compile(R + r"/(tarball|zipball)(/.*)?$")
 READ_METHODS = ("GET", "HEAD")
 
 
 def _glob_path(pattern: str, path: str) -> bool:
-    rx = "^" + re.escape(pattern).replace(r"\{owner\}", "[^/]+").replace(r"\{repo\}", "[^/]+") \
-        .replace(r"\*\*", ".*").replace(r"\*", "[^/]*") + "$"
+    rx = "^" + re.escape(pattern).replace(r"\{owner\}", _NAME).replace(r"\{repo\}", _NAME) \
+        .replace(r"\*\*", "[A-Za-z0-9_./-]*").replace(r"\*", "[A-Za-z0-9_.-]*") + "$"
     return re.match(rx, path) is not None
 
 
@@ -169,10 +212,18 @@ def _json(body: bytes | None):
         return {}
     try:
         v = strict_json(body)
-    except (ValueError, UnicodeDecodeError):
+    except (ValueError, UnicodeDecodeError, RecursionError):
         raise ValueError("body is not JSON (or has duplicate keys)")
     if not isinstance(v, dict):
         raise ValueError("body is not a JSON object")
+    return v
+
+
+def _str(body: dict, key: str):
+    """A body field the policy reads: absent, or a string. Anything else is refused."""
+    v = body.get(key)
+    if v is not None and not isinstance(v, str):
+        raise ValueError(f"field {key!r} must be a string")
     return v
 
 
@@ -180,17 +231,23 @@ def rest_needs_body(method: str, path: str) -> bool:
     """Whether the checker for this endpoint inspects the body (so the server buffers it)."""
     for m, rx, kind in REST_WRITES:
         if m == method and rx.match(path):
-            return kind in ("review", "ref_create", "contents", "merges", "pr_patch")
+            return kind in BODY_CHECKERS
     return False
 
 
 def rest_request(policy: Policy, method: str, path: str, body: bytes | None) -> Decision:
+    if "%" in path and not CONTENTS_PATH.match(path):
+        return deny("percent-encoding is only accepted in a contents file path")
     rm = REPO_PATH.match(path)
+    if path.startswith("/repos/") and not rm:
+        return deny("unrecognised /repos/ path")
     repo = f"{rm['owner']}/{rm['repo']}" if rm else None
     if repo and not policy.repo_allowed(repo):
         return deny("repo not in policy", repo=repo)
 
     if method in READ_METHODS:
+        if REFUSED_READS.match(path):
+            return deny("archive downloads redirect with a signed token", repo=repo)
         if repo:
             return allow("read", repo=repo)
         if any(_glob_path(p, path) for p in policy.read_paths):
@@ -204,27 +261,30 @@ def rest_request(policy: Policy, method: str, path: str, body: bytes | None) -> 
         if not mm:
             continue
         try:
-            return _rest_check(policy, kind, repo, mm, _json(body) if rest_needs_body(method, path) else {})
+            return _rest_check(policy, kind, repo, mm, _json(body) if kind in BODY_CHECKERS else {})
         except ValueError as e:
-            return deny(str(e), repo=repo)
+            return deny(str(e), repo=repo, access="write")
 
-    if any(m == method and _glob_path(p, path) for m, p in policy.rest_allow):
+    if repo and any(m == method and _glob_path(p, path) for m, p in policy.rest_allow):
         return allow("rest_allow", repo=repo, access="write")
-    return deny("no rule allows this write", repo=repo)
+    return deny("no rule allows this write", repo=repo, access="write")
 
 
 def _rest_check(policy: Policy, kind: str, repo: str, m, body: dict) -> Decision:
     w = dict(repo=repo, access="write")
     if kind == "plain":
         return allow("allowed write", **w)
-    if kind == "pr_patch":
-        # Retargeting a PR onto a protected base is how a merge gate gets walked around.
-        if "base" in body and policy.merge_protected(repo, str(body["base"])):
-            return deny(f"retargeting to protected base {body['base']!r}", **w)
-        return allow("pr update", **w)
+    if kind in ("pr_patch", "pr_create"):
+        # Opening or retargeting a PR onto a protected base is how a merge gate gets walked around
+        # (with auto-merge, or a merge racing the retarget). Opening one is fine; retargeting is not.
+        base = _str(body, "base")
+        _str(body, "head")
+        if kind == "pr_patch" and base is not None and policy.merge_protected(repo, base):
+            return deny(f"retargeting to protected base {base!r}", **w)
+        return allow("pr create/update", **w)
     if kind == "review":
-        event = body.get("event")
-        if policy.deny_approvals and str(event).upper() == "APPROVE":
+        event = _str(body, "event")
+        if policy.deny_approvals and (event or "").upper() == "APPROVE":
             return deny("approvals are not allowed", **w)
         return allow("review without approval", **w)
     if kind == "merge":
@@ -232,7 +292,7 @@ def _rest_check(policy: Policy, kind: str, repo: str, m, body: dict) -> Decision
     if kind == "update_branch":
         return allow("update-branch; head checked upstream", **w, lookup={"pr_head": int(m["num"])})
     if kind == "ref_create":
-        ref = str(body.get("ref", ""))
+        ref = _str(body, "ref") or ""
         if ref.startswith("refs/heads/") and policy.branch_pushable(ref[11:]):
             return allow("create allowed branch", **w)
         if ref.startswith("refs/tags/") and policy.push_tags:
@@ -243,14 +303,14 @@ def _rest_check(policy: Policy, kind: str, repo: str, m, body: dict) -> Decision
             return allow("branch ref write", **w)
         return deny(f"ref write to branch {m['branch']!r} not allowed", **w)
     if kind == "contents":
-        branch = body.get("branch")
+        branch = _str(body, "branch")
         if not branch:
             return deny("contents write without an explicit branch targets the default branch", **w)
-        if policy.branch_pushable(str(branch)):
+        if policy.branch_pushable(branch):
             return allow("contents write to allowed branch", **w)
         return deny(f"contents write to branch {branch!r} not allowed", **w)
     if kind == "merges":
-        base = str(body.get("base", ""))
+        base = _str(body, "base") or ""
         if policy.branch_pushable(base):
             return allow("merge into allowed branch", **w)
         return deny(f"merge into branch {base!r} not allowed", **w)
@@ -260,7 +320,6 @@ def _rest_check(policy: Policy, kind: str, repo: str, m, body: dict) -> Decision
 # ---------------------------------------------------------------- GraphQL
 
 REVIEW_MUTATIONS = {"addPullRequestReview", "submitPullRequestReview"}
-MERGE_MUTATIONS = {"mergePullRequest", "enablePullRequestAutoMerge"}
 UNRESOLVED = object()
 
 
@@ -269,10 +328,13 @@ def _value(node, variables):
     if node is None:
         return None
     if isinstance(node, gast.VariableNode):
-        return variables.get(node.name.value, None) if isinstance(variables, dict) else UNRESOLVED
+        name = node.name.value
+        return variables[name] if name in variables else UNRESOLVED
     if isinstance(node, gast.ObjectValueNode):
         out = {}
         for f in node.fields:
+            if f.name.value in out:
+                return UNRESOLVED
             v = _value(f.value, variables)
             if v is UNRESOLVED:
                 return UNRESOLVED
@@ -283,37 +345,53 @@ def _value(node, variables):
         return UNRESOLVED if any(v is UNRESOLVED for v in vals) else vals
     if isinstance(node, gast.NullValueNode):
         return None
-    if isinstance(node, (gast.EnumValueNode, gast.StringValueNode)):
-        return node.value
-    if isinstance(node, gast.BooleanValueNode):
-        return node.value
-    if isinstance(node, (gast.IntValueNode, gast.FloatValueNode)):
+    if isinstance(node, (gast.EnumValueNode, gast.StringValueNode, gast.BooleanValueNode,
+                         gast.IntValueNode, gast.FloatValueNode)):
         return node.value
     return UNRESOLVED
 
 
 def _input(field_node, variables):
+    """The resolved `input` argument of a mutation field, {} if absent, UNRESOLVED if unreadable."""
+    names = [a.name.value for a in field_node.arguments or ()]
+    if len(names) != len(set(names)):
+        return UNRESOLVED
     for a in field_node.arguments or ():
         if a.name.value == "input":
             v = _value(a.value, variables)
-            return v if isinstance(v, dict) or v is UNRESOLVED else UNRESOLVED
+            return v if isinstance(v, dict) else UNRESOLVED
     return {}
+
+
+def _too_deep(query: str) -> bool:
+    depth = peak = 0
+    for ch in query:
+        if ch in "{([":
+            depth += 1
+            peak = max(peak, depth)
+        elif ch in "})]":
+            depth -= 1
+    return peak > GQL_MAX_DEPTH
 
 
 def graphql_request(policy: Policy, body: bytes) -> Decision:
     try:
         req = strict_json(body)
-    except (ValueError, UnicodeDecodeError):
+    except (ValueError, UnicodeDecodeError, RecursionError):
         return deny("graphql body is not JSON (or has duplicate keys)")
     if not isinstance(req, dict) or not isinstance(req.get("query"), str):
         return deny("graphql body must be a single {query, variables} object")
     variables = req.get("variables") or {}
     if not isinstance(variables, dict):
         return deny("graphql variables must be an object")
+    if _too_deep(req["query"]):
+        return deny(f"graphql document nested deeper than {GQL_MAX_DEPTH}")
     try:
-        doc = gql_parse(req["query"], no_location=True)
+        doc = gql_parse(req["query"], no_location=True, max_tokens=GQL_MAX_TOKENS)
     except GraphQLError as e:
         return deny(f"graphql parse error: {e.message}")
+    except RecursionError:
+        return deny("graphql document too deeply nested")
 
     ops, fields, lookups = [], [], []
     for d in doc.definitions:
@@ -327,14 +405,18 @@ def graphql_request(policy: Policy, body: bytes) -> Decision:
             continue
         if op != "mutation":
             return deny(f"graphql {op} not allowed")
-        # Effective variables: declared defaults, overridden by supplied values.
+        # Effective variables: declared ones only; supplied value, else default, else null.
         op_vars = {}
         for vd in d.variable_definitions or ():
             vname = vd.variable.name.value
+            if vname in op_vars:
+                return deny(f"variable ${vname} declared twice")
             if vname in variables:
                 op_vars[vname] = variables[vname]
             elif vd.default_value is not None:
                 op_vars[vname] = _value(vd.default_value, {})
+            else:
+                op_vars[vname] = None
         for sel in d.selection_set.selections:
             if not isinstance(sel, gast.FieldNode):
                 return deny("fragments at the top level of a mutation are not allowed")
@@ -343,20 +425,24 @@ def graphql_request(policy: Policy, body: bytes) -> Decision:
             if name not in policy.mutations:
                 return deny(f"mutation {name} not allowed", detail={"mutations": fields})
             inp = _input(sel, op_vars)
+            if inp is UNRESOLVED:
+                return deny(f"{name}: could not resolve its input", detail={"mutations": fields})
             if name in REVIEW_MUTATIONS and policy.deny_approvals:
-                if inp is UNRESOLVED:
-                    return deny(f"{name}: could not resolve input to check the review event")
                 event = inp.get("event")
-                if event is UNRESOLVED or not isinstance(event, (str, type(None))) \
-                        or (event or "").upper() == "APPROVE":
+                if not isinstance(event, (str, type(None))) or (event or "").upper() == "APPROVE":
                     return deny("approvals are not allowed", detail={"mutations": fields})
                 if name == "submitPullRequestReview" and event is None:
                     return deny("submitPullRequestReview without an event")
-            if name in MERGE_MUTATIONS:
-                pr = inp.get("pullRequestId") if isinstance(inp, dict) else None
+            if name == "mergePullRequest":
+                pr = inp.get("pullRequestId")
                 if not isinstance(pr, str) or not pr:
                     return deny(f"{name}: could not resolve pullRequestId")
-                lookups.append(pr)
+                lookups.append({"id": pr, "base": None})
+            if name == "updatePullRequest" and inp.get("baseRefName") is not None:
+                pr, base = inp.get("pullRequestId"), inp.get("baseRefName")
+                if not isinstance(pr, str) or not pr or not isinstance(base, str):
+                    return deny(f"{name}: could not resolve pullRequestId and baseRefName")
+                lookups.append({"id": pr, "base": normalise_branch(base)})
     if not ops:
         return deny("graphql document has no operation")
     mutating = "mutation" in ops

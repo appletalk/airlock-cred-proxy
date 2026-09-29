@@ -12,10 +12,20 @@ DEFAULT_MUTATIONS = frozenset({
     "addPullRequestReview", "addPullRequestReviewComment", "addPullRequestReviewThread",
     "closeIssue", "closePullRequest", "convertPullRequestToDraft", "createIssue",
     "createPullRequest", "deleteIssueComment", "disablePullRequestAutoMerge",
-    "enablePullRequestAutoMerge", "markPullRequestReadyForReview", "mergePullRequest",
+    "markPullRequestReadyForReview", "mergePullRequest",
     "removeAssigneesFromAssignable", "removeLabelsFromLabelable", "reopenIssue",
     "reopenPullRequest", "requestReviews", "submitPullRequestReview", "updateIssue",
     "updateIssueComment", "updatePullRequest",
+})
+
+# Mutations that move refs or merge without a checker in this proxy. They cannot be enabled:
+# auto-merge and the merge queue act later, after the base can have been retargeted.
+NEVER_MUTATIONS = frozenset({
+    "enablePullRequestAutoMerge", "enqueuePullRequest", "createCommitOnBranch", "mergeBranch",
+    "updateRefs", "createRef", "updateRef", "deleteRef", "updatePullRequestBranch",
+    "revertPullRequest",
+    "cloneTemplateRepository", "createRepository", "deleteRepository", "transferRepository",
+    "updateBranchProtectionRule", "deleteBranchProtectionRule", "createBranchProtectionRule",
 })
 
 DEFAULT_READ_PATHS = ("/rate_limit", "/meta", "/zen", "/users/*")
@@ -25,6 +35,11 @@ ACCESS_LEVELS = ("read", "write")
 
 class ConfigError(ValueError):
     pass
+
+
+def normalise_branch(name: str) -> str:
+    """GitHub accepts both 'main' and 'refs/heads/main' for a branch; compare the short form."""
+    return name[len("refs/heads/"):] if name.startswith("refs/heads/") else name
 
 
 @dataclass
@@ -46,11 +61,13 @@ class Policy:
         return full_name.lower() in {r.lower() for r in self.repos}
 
     def branch_pushable(self, branch: str) -> bool:
+        branch = normalise_branch(branch)
         if self.merge_protected(None, branch):
             return False
         return any(fnmatchcase(branch, p) for p in self.push_branches)
 
     def merge_protected(self, full_name: str | None, base: str) -> bool:
+        base = normalise_branch(base)
         pats = list(self.merge_denied_bases)
         if full_name:
             for name, extra in self.repo_merge_denied_bases.items():
@@ -119,6 +136,11 @@ def parse(data: dict) -> Config:
 
     repo_tables = pol.get("repo", {})
     mutations = pol.get("graphql_mutations")
+    if mutations is not None:
+        bad = sorted(set(mutations) & NEVER_MUTATIONS)
+        if bad:
+            raise ConfigError(f"policy.graphql_mutations cannot include {', '.join(bad)}: "
+                              "they move refs or merge without a check this proxy can make")
     policy = Policy(
         repos=list(repos),
         permissions=perms,
@@ -153,6 +175,15 @@ def parse(data: dict) -> Config:
     )
     if kind == "github-app" and not (cfg.app_id and cfg.owner and "key" in ident):
         raise ConfigError("github-app identity needs app_id, owner and key")
+    if cfg.socket_mode & 0o007:
+        raise ConfigError("server.socket_mode must not grant access to other users")
+    if kind == "github-app":
+        stray = [r for r in cfg.policy.repos if r != "*" and r.split("/", 1)[0].lower() != cfg.owner.lower()]
+        stray += [r for r in cfg.policy.repo_merge_denied_bases if r.split("/", 1)[0].lower() != cfg.owner.lower()]
+        if stray:
+            raise ConfigError(f"repos outside the installation owner {cfg.owner!r}: {', '.join(stray)}")
+    if any("/" not in r for r in cfg.policy.repos if r != "*"):
+        raise ConfigError("policy.repos entries must be owner/name")
     if len(cfg.socket.encode()) > 107:
         raise ConfigError("server.socket path is longer than the 107-byte Unix socket limit")
     return cfg
