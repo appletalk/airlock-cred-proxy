@@ -1,0 +1,51 @@
+name: ci
+
+# unit     - the suite, including end-to-end runs of the real proxy with real git over
+#            SOCKS5 against a fake GitHub. Oldest supported Python and the newest.
+# mutation - breaks each protection in a scratch copy and requires a test to fail, so a
+#            green suite cannot hide a check that no longer checks anything.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install from the hash-pinned lock
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --require-hashes -r requirements.lock
+          .venv/bin/pip install --no-deps .
+      - name: Tool versions (git needs a curl with SOCKS over a Unix socket)
+        run: git --version && curl --version | head -1
+      - run: .venv/bin/python -m unittest discover -s tests -t . -v
+
+  mutation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Install from the hash-pinned lock
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --require-hashes -r requirements.lock
+          .venv/bin/pip install --no-deps .
+      - run: .venv/bin/python -u tests/mutate.py
