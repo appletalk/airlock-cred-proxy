@@ -159,9 +159,46 @@ def gql(query, variables=None):
 class BoardIdentity(unittest.TestCase):
     """A token identity pinned to one project board, with REST writes off."""
 
+    MUTS = ["updateProjectV2ItemFieldValue", "clearProjectV2ItemFieldValue",
+            "addProjectV2ItemById", "archiveProjectV2Item"]
+
     def board(self, **over):
-        return pol(graphql_mutations=["updateProjectV2ItemFieldValue", "addProjectV2ItemById"],
-                   projects=["PVT_board"], rest_writes=False, **over)
+        return pol(**{"graphql_mutations": self.MUTS, "projects": ["PVT_board"], "rest_writes": False, **over})
+
+    def test_clear_and_archive_are_pinned_too(self):
+        for name, extra in (("clearProjectV2ItemFieldValue", 'itemId:"I", fieldId:"F"'),
+                            ("archiveProjectV2Item", 'itemId:"I"')):
+            for pid, ok in (("PVT_board", True), ("PVT_other", False)):
+                q = f'mutation {{ {name}(input:{{projectId:"{pid}", {extra}}}) {{ clientMutationId }} }}'
+                self.assertEqual(policy.graphql_request(self.board(), gql(q)).allow, ok, (name, pid))
+
+    def test_empty_projects_list_refuses_every_project_mutation(self):
+        q = 'mutation { addProjectV2ItemById(input:{projectId:"PVT_board", contentId:"C"}) { item { id } } }'
+        self.assertFalse(policy.graphql_request(self.board(projects=[]), gql(q)).allow)
+
+    def test_non_string_project_id_refused(self):
+        q = 'mutation { addProjectV2ItemById(input:{projectId:["PVT_board"], contentId:"C"}) { item { id } } }'
+        self.assertFalse(policy.graphql_request(self.board(), gql(q)).allow)
+
+    def test_rest_writes_off_covers_every_write_method(self):
+        p = self.board()
+        for m, path in (("PUT", "/repos/acme/app/contents/a"), ("DELETE", "/repos/acme/app/issues/comments/1"),
+                        ("POST", "/repos/acme/app/issues"), ("PATCH", "/repos/acme/app/issues/1"),
+                        ("OPTIONS", "/repos/acme/app/issues")):
+            self.assertFalse(policy.rest_request(p, m, path, b'{"branch":"agent/x"}').allow, m)
+
+    def test_every_project_mutation_that_can_be_enabled_is_pinned(self):
+        classified = {m for m in config.SAFE_MUTATIONS if "ProjectV2" in m}
+        self.assertTrue(classified)
+        self.assertLessEqual(classified, policy.PROJECT_MUTATIONS)
+
+    def test_token_identity_board_config(self):
+        cfg = config.parse({"server": {"socket": "/tmp/b.sock"},
+                            "identity": {"kind": "token", "token": {"command": ["true"]}},
+                            "policy": {"repos": ["acme/tracker"], "graphql_mutations": self.MUTS,
+                                       "projects": ["PVT_board"], "rest_writes": False}})
+        q = 'mutation { archiveProjectV2Item(input:{projectId:"PVT_other", itemId:"I"}) { clientMutationId } }'
+        self.assertFalse(policy.graphql_request(cfg.policy, gql(q)).allow)
 
     def test_project_mutation_on_the_allowed_board(self):
         q = 'mutation { updateProjectV2ItemFieldValue(input:{projectId:"PVT_board", itemId:"I", fieldId:"F", value:{date:"2030-01-01"}}) { clientMutationId } }'
@@ -195,6 +232,25 @@ class BoardIdentity(unittest.TestCase):
 
 
 class Config(unittest.TestCase):
+    def test_booleans_must_be_booleans(self):
+        for key in ("rest_writes", "push_tags", "deny_approvals"):
+            with self.assertRaises(config.ConfigError, msg=key):
+                pol(**{key: "false"})
+
+    def test_projects_must_be_a_list_of_project_ids(self):
+        for bad in ("PVT_board", ["board"], [1]):
+            with self.assertRaises(config.ConfigError, msg=repr(bad)):
+                pol(projects=bad)
+
+    def test_token_identity_with_project_mutations_must_pin_a_board(self):
+        base = {"server": {"socket": "/tmp/b.sock"},
+                "identity": {"kind": "token", "token": {"command": ["true"]}},
+                "policy": {"repos": ["acme/tracker"], "graphql_mutations": ["addProjectV2ItemById"]}}
+        with self.assertRaises(config.ConfigError):
+            config.parse(base)
+        base["policy"]["projects"] = ["PVT_board"]
+        config.parse(base)
+
     def test_unclassified_mutations_refused(self):
         for m in ("createLinkedBranch", "dismissPullRequestReview", "someFutureMutation"):
             with self.assertRaises(config.ConfigError, msg=m):

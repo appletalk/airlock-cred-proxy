@@ -31,4 +31,4 @@ merge_denied_bases = ["release/*"]           # added to the global list for this
 # rest_allow = [["POST", "/repos/{owner}/{repo}/check-runs"]] # extra REST writes
 # read_paths = ["/rate_limit", "/meta", "/zen", "/users/*"]   # non-repo GETs
 # projects = ["PVT_kwDO..."]      # pin project (v2) mutations to these boards
-# rest_writes = false             # GraphQL only: refuse every REST write
+# rest_writes = false             # refuse every REST write (git pushes follow push_branches)

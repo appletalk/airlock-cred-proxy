@@ -24,8 +24,8 @@ what the agent may reach, and log everything.
 | Protected bases | Merging a PR into a `merge_denied_bases` branch is refused. The proxy looks up the PR's real base on GitHub instead of trusting the request. Retargeting a PR onto a protected base is refused over REST and GraphQL. Auto-merge and the merge queue cannot be enabled, because they act after the check. |
 | REST writes | Only a fixed set of pull-request, issue and branch endpoints. Everything else is refused unless listed in `rest_allow`. |
 | GraphQL | Parsed with `graphql-core`. Queries pass. Mutations must be in the allowlist, and the allowlist can only name mutations the proxy has classified. Anything that moves refs or merges without a check here (auto-merge, the merge queue, `createCommitOnBranch`, `updateRefs`) is never classified. Subscriptions, top-level fragments in mutations, duplicate fields or JSON keys, undeclared variables and deeply nested documents are refused. |
-| Project boards | With `projects = ["PVT_..."]`, project (v2) mutations must name one of those boards in `input.projectId`, including through variables. Pins a token identity to one board. |
-| REST writes | `rest_writes = false` refuses every REST write, for an identity that should only use GraphQL (a project board, say). |
+| Project boards | With `projects = ["PVT_..."]`, project (v2) mutations must name one of those boards in `input.projectId`, including through variables. A token identity that allows project mutations must set it. The pin checks the board a request names; whether GitHub also refuses an item or field from another board under that name is GitHub's check, so verify it on a scratch board before relying on it. |
+| REST writes | `rest_writes = false` refuses every REST write (for an identity meant to use GraphQL). Git pushes are separate: they follow `push_branches` and `push_tags`. |
 | Request hygiene | Non-ASCII or non-canonical paths, `%` outside a contents file path, malformed or folded headers, query strings and method-override headers on writes, ambiguous body framing and unknown hosts are refused. Archive and release-asset downloads are refused because their redirects carry a GitHub-signed URL. |
 | Resource limits | Inspected bodies are capped at 1 MiB, read in pieces, and parsed a few at a time. A request must be read and authorised within 30 seconds. Connections are capped overall and per calling uid. |
 | Audit | One JSON line per request: time, peer pid and uid, method, host, path, repo, decision, reason, status, bytes. Never tokens or bodies. |
@@ -111,7 +111,10 @@ read-only; the proxy's whole security model assumes the agent holds nothing else
   an agent can use a narrow slice of it without holding it. The token cannot be narrowed
   at mint time, so the policy is the only control. GraphQL queries and mutations are not
   limited by repo: an allowed mutation works on any repo the token reaches. Use a tight
-  `graphql_mutations` list, and prefer a GitHub App wherever one can do the job.
+  `graphql_mutations` list, and prefer a GitHub App wherever one can do the job. Note what
+  unrestricted reads plus any write allow together: a board-only identity can read a private
+  file through a query and write it into a board text field, where every board viewer sees
+  it. Keep free-text fields off a board fronted this way, or accept that.
 
 One identity per proxy instance. Run one instance per identity, each with its own socket.
 

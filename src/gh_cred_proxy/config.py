@@ -101,6 +101,23 @@ class Config:
     policy: Policy = field(repr=False)
 
 
+def _bool(table: dict, key: str, default: bool) -> bool:
+    """A TOML boolean. A string such as "false" is truthy in Python, so it is refused."""
+    v = table.get(key, default)
+    if not isinstance(v, bool):
+        raise ConfigError(f"policy.{key} must be true or false, not {v!r}")
+    return v
+
+
+def _projects(table: dict):
+    if "projects" not in table:
+        return None
+    v = table["projects"]
+    if not isinstance(v, list) or not all(isinstance(p, str) and p.startswith("PVT_") for p in v):
+        raise ConfigError("policy.projects must be a list of project node IDs (PVT_...)")
+    return frozenset(v)
+
+
 def _need(table: dict, key: str, where: str):
     if key not in table:
         raise ConfigError(f"missing {where}.{key}")
@@ -149,14 +166,14 @@ def parse(data: dict) -> Config:
         repos=list(repos),
         permissions=perms,
         push_branches=list(pol.get("push_branches", [])),
-        push_tags=bool(pol.get("push_tags", False)),
-        deny_approvals=bool(pol.get("deny_approvals", True)),
+        push_tags=_bool(pol, "push_tags", False),
+        deny_approvals=_bool(pol, "deny_approvals", True),
         merge_denied_bases=list(pol.get("merge_denied_bases", [])),
         repo_merge_denied_bases={n: list(t.get("merge_denied_bases", [])) for n, t in repo_tables.items()},
         mutations=frozenset(mutations) if mutations is not None else DEFAULT_MUTATIONS,
         rest_allow=[(m.upper(), p) for m, p in pol.get("rest_allow", [])],
-        rest_writes=bool(pol.get("rest_writes", True)),
-        projects=frozenset(pol["projects"]) if "projects" in pol else None,
+        rest_writes=_bool(pol, "rest_writes", True),
+        projects=_projects(pol),
         read_paths=tuple(pol.get("read_paths", DEFAULT_READ_PATHS)),
     )
 
@@ -181,6 +198,11 @@ def parse(data: dict) -> Config:
     )
     if kind == "github-app" and not (cfg.app_id and cfg.owner and "key" in ident):
         raise ConfigError("github-app identity needs app_id, owner and key")
+    # A token identity cannot be narrowed at mint time, so project mutations without a board
+    # pin would reach every board the token can edit.
+    project_muts = {m for m in cfg.policy.mutations if "ProjectV2" in m}
+    if kind == "token" and project_muts and cfg.policy.projects is None:
+        raise ConfigError(f"a token identity allowing {', '.join(sorted(project_muts))} must set policy.projects")
     if cfg.socket_mode & 0o007:
         raise ConfigError("server.socket_mode must not grant access to other users")
     if kind == "github-app":
