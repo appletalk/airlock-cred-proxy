@@ -437,14 +437,24 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(self.gate.status()["state"], "locked")
 
     def test_chunked_unlock_refused(self):
-        c = client.UnixHTTPConnection(self.admin)
+        # Transfer-Encoding with a Content-Length that frames a valid body: only the explicit
+        # refusal stops this, so the two framings can never be read differently.
+        body = json.dumps({"secrets": {"github/app.pem": self.key}}).encode()
+        s = socket.socket(socket.AF_UNIX)
+        s.connect(self.admin)
         try:
-            body = json.dumps({"secrets": {"github/app.pem": self.key}}).encode()
-            c.request("POST", "/unlock", body=iter([body]), headers={"Host": "x"}, encode_chunked=True)
-            self.assertEqual(c.getresponse().status, 400)
+            s.sendall(b"POST /unlock HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n"
+                      b"Content-Length: %d\r\n\r\n%s" % (len(body), body))
+            self.assertIn(b" 400 ", s.recv(4096).split(b"\r\n", 1)[0] + b" ")
         finally:
-            c.close()
+            s.close()
         self.assertEqual(self.gate.status()["state"], "locked")
+
+    def test_failed_audit_write_does_not_hide_an_unlock(self):
+        with mock.patch.object(self.gate, "_log", side_effect=OSError("disk full")):
+            st, reply = self.do_unlock()
+        self.assertEqual(st, 200, reply)
+        self.assertEqual(self.gate.status()["state"], "unlocked")
 
     def test_allowed_request_resets_idle(self):
         self.do_unlock()

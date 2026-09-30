@@ -149,7 +149,10 @@ class UnlockGate:
             self._boot_deadline = self.boot() + (expires - now)
             self._last_used = now
         self._wake.set()
-        self._log(event="unlock", identity=cred.identity.get("login"), expires_at=fmt(self._expires_at))
+        try:
+            self._log(event="unlock", identity=cred.identity.get("login"), expires_at=fmt(self._expires_at))
+        except Exception:  # noqa: BLE001 - installed is installed; a failed audit write must not report otherwise
+            pass
         return self.status()
 
     def lock(self, reason="locked by operator"):

@@ -78,6 +78,7 @@ MUTANTS = [
  ("unlock: for capped at max_lifetime", "unlock.py", '        d = now + min(for_seconds, u.max_lifetime)', '        d = min(d, now + for_seconds)'),
  ("unlock: DST-naive expire_at", "unlock.py", '            ts = time.mktime((at + dt.timedelta(days=1)).timetuple())', '            ts = ts + 86400'),
  ("unlock: any build failure is a 422", "unlock.py", '        except Exception as e:  # noqa: BLE001 - any failure to build leaves the gate as it was', '        except (ValueError, KeyError) as e:'),
+ ("unlock: audit failure does not hide an unlock", "unlock.py", '        except Exception:  # noqa: BLE001 - installed is installed; a failed audit write must not report otherwise\n            pass', '        finally:\n            pass'),
  ("unlock: expiry does not bump generation", "unlock.py", '        # Dropping the credential drops its cache of minted App tokens with it.\n        self._cred = None', '        # Dropping the credential drops its cache of minted App tokens with it.\n        self._generation += 1\n        self._cred = None'),
 ]
 bad = 0
