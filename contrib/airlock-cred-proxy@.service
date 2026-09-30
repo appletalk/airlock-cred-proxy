@@ -18,6 +18,9 @@ LogsDirectoryMode=0750
 UMask=0077
 Restart=on-failure
 MemoryMax=512M
+# A credential delivered by unlock lives only in memory: keep it out of swap and core dumps.
+MemorySwapMax=0
+LimitCORE=0
 # One thread per connection (MAX_CONNECTIONS=64) plus headroom.
 TasksMax=160
 

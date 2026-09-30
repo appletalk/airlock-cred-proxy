@@ -43,6 +43,14 @@ reaches the socket as a SOCKS5 proxy.
   the access the request needs.
 - **Log decisions, not secrets.** The audit log never contains tokens or bodies.
 
+## Unlock
+
+With a `pass` source the credential is held only in memory, from an operator's unlock until
+its deadline. The agent can never unlock: the admin socket, the password store and the gpg
+key stay outside the box. This rests on the box being unable to run code on the host as the
+operator. [docs/unlock.md](docs/unlock.md) sets out the boundary, what enforces each part,
+and the airlock gaps it depends on.
+
 ## Known limits
 
 - A `token` identity cannot be narrowed at mint time. GraphQL queries and allowed

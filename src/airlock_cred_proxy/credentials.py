@@ -50,9 +50,9 @@ def _b64(b: bytes) -> str:
 class AppCredential:
     """Mints installation tokens scoped per request and caches them until near expiry."""
 
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, secret: str | None = None):
         self.cfg = cfg
-        pem = read_source(cfg.key_source)
+        pem = secret if secret is not None else read_source(cfg.key_source)
         try:
             self._key = serialization.load_pem_private_key(pem.encode(), password=None)
         except ValueError as e:
@@ -113,9 +113,11 @@ class AppCredential:
 class TokenCredential:
     """A fixed token (for example a user's session token). Scope comes from policy only."""
 
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, secret: str | None = None):
         self.cfg = cfg
-        self._token = read_source(cfg.token_source).strip()
+        # A pass entry keeps the secret on its first line; later lines are notes.
+        self._token = secret.split("\n", 1)[0].strip() if secret is not None \
+            else read_source(cfg.token_source).strip()
         if not self._token:
             raise ConfigError("identity.token resolved to an empty string")
         user = api_call(cfg.api_url, "GET", "/user", f"token {self._token}")
@@ -133,5 +135,5 @@ class TokenCredential:
         return f"Basic {base64.b64encode(raw).decode()}"
 
 
-def build(cfg: Config):
-    return AppCredential(cfg) if cfg.kind == "github-app" else TokenCredential(cfg)
+def build(cfg: Config, secret: str | None = None):
+    return AppCredential(cfg, secret) if cfg.kind == "github-app" else TokenCredential(cfg, secret)

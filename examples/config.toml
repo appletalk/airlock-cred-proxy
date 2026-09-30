@@ -14,6 +14,7 @@ app_id = 123456
 owner = "example-org"                        # the installation's account
 # installation_id = 0                        # optional; found from owner when unset
 key = { systemd_credential = "app-key" }     # or { file = "/path/key.pem" } or { command = ["pass", "show", "x"] }
+                                             # or { pass = "github/app.pem" }: delivered by `unlock`, see [unlock]
 
 [policy]
 repos = ["example-org/service-a", "example-org/service-b"]
@@ -32,3 +33,9 @@ merge_denied_bases = ["release/*"]           # added to the global list for this
 # read_paths = ["/rate_limit", "/meta", "/zen", "/users/*"]   # non-repo GETs
 # projects = ["PVT_kwDO..."]      # pin project (v2) mutations to these boards
 # rest_writes = false             # refuse every REST write (git pushes follow push_branches)
+
+# With a pass source (docs/unlock.md):
+# [unlock]
+# max_lifetime = "10h"          # required, at most 24h
+# expire_at = "18:00"           # optional, local time
+# idle = "2h"                   # optional

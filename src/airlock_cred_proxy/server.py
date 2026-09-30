@@ -20,7 +20,7 @@ import time
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlsplit
 
-from . import credentials, policy
+from . import client, credentials, policy, unlock
 from .config import Config
 
 MAX_INSPECT = 1 << 20          # bodies the policy reads are buffered up to this size
@@ -35,11 +35,12 @@ CLIENT_TIMEOUT = 60
 UPSTREAM_TIMEOUT = 600
 IDENTITY_PATH = "/_airlock-cred-proxy/identity"
 HEALTH_PATH = "/_airlock-cred-proxy/health"
+LOCKED_STATUS = 423
 
 HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te",
               "trailer", "transfer-encoding", "upgrade", "proxy-connection"}
 STRIP_REQUEST = HOP_BY_HOP | {"host", "authorization", "cookie", "expect", "content-length"}
-STRIP_RESPONSE = HOP_BY_HOP | {"content-length", "set-cookie"}
+STRIP_RESPONSE = HOP_BY_HOP | {"content-length", "set-cookie", "x-airlock-cred-proxy"}
 METHOD_OVERRIDE = ("x-http-method-override", "x-http-method", "x-method-override")
 HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")   # RFC 9110 token
 BAD_HEADER_VALUE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")      # controls other than tab
@@ -183,9 +184,22 @@ def buffer_body(it, limit):
     return bytes(out)
 
 
+def locked(reason):
+    return Refused(LOCKED_STATUS, f"credential locked ({reason}); unlock on the host with 'airlock-cred-proxy unlock'")
+
+
 class Proxy:
-    def __init__(self, cfg: Config, cred, audit: AuditLog):
-        self.cfg, self.cred, self.audit = cfg, cred, audit
+    def __init__(self, cfg: Config, gate, audit: AuditLog):
+        # A bare credential (tests, check-config) is a gate that never locks.
+        self.gate = gate if hasattr(gate, "current") else unlock.StaticGate(gate)
+        self.cfg, self.audit = cfg, audit
+
+    @property
+    def cred(self):
+        try:
+            return self.gate.current()
+        except unlock.Locked as e:
+            raise locked(e) from None
 
     def scope(self, repo):
         """Repo names to scope an App token to. Refuses repos outside the installation owner."""
@@ -199,12 +213,12 @@ class Proxy:
     def perms(self, access):
         return self.cfg.policy.permissions if access == "write" else self.cfg.policy.read_permissions()
 
-    def resolve_lookup(self, d: policy.Decision):
+    def resolve_lookup(self, d: policy.Decision, cred):
         """Checks that need GitHub's view of a pull request. Any failure refuses the request."""
         lk, pol = d.lookup, self.cfg.policy
         if "pr_base" in lk or "pr_head" in lk:
             num = lk.get("pr_base") or lk.get("pr_head")
-            auth = self.cred.authorization(self.scope(d.repo), self.perms("read"))
+            auth = cred.authorization(self.scope(d.repo), self.perms("read"))
             try:
                 pr = credentials.api_call(self.cfg.api_url, "GET", f"/repos/{d.repo}/pulls/{num}", auth)
                 base = pr["base"]["ref"]
@@ -221,7 +235,7 @@ class Proxy:
         if items:
             q = ("query($ids:[ID!]!){nodes(ids:$ids){... on PullRequest"
                  "{baseRefName repository{nameWithOwner}}}}")
-            auth = self.cred.authorization(None, self.perms("read"))
+            auth = cred.authorization(None, self.perms("read"))
             try:
                 r = credentials.api_call(self.cfg.api_url, "POST", "/graphql", auth,
                                          {"query": q, "variables": {"ids": [i["id"] for i in items]}})
@@ -357,6 +371,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response_only(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
+        if status == LOCKED_STATUS:
+            self.send_header("X-Airlock-Cred-Proxy", "locked")
         self.send_header("Connection", "close")
         self.end_headers()
         if self.command != "HEAD":
@@ -366,8 +382,12 @@ class Handler(BaseHTTPRequestHandler):
         if self.command != "GET":
             raise Refused(405, "GET only")
         cfg = px.cfg
-        payload = dict(px.cred.identity, api_host=cfg.api_host, git_host=cfg.git_host) \
-            if path == IDENTITY_PATH else {"status": "ok"}
+        if path == IDENTITY_PATH:
+            if px.gate.identity is None:
+                px.cred        # locked since start: nothing to report, answer 423
+            payload = dict(px.gate.identity, api_host=cfg.api_host, git_host=cfg.git_host)
+        else:
+            payload = {"status": "ok", "api_host": cfg.api_host, "git_host": cfg.git_host, **px.gate.status()}
         data = json.dumps(payload).encode()
         self.send_response_only(200)
         self.send_header("Content-Type", "application/json")
@@ -381,7 +401,7 @@ class Handler(BaseHTTPRequestHandler):
         cfg, pol = px.cfg, px.cfg.policy
         t0 = time.monotonic()
         rec = {"ts": now(), "peer": self._peer(), "method": self.command,
-               "identity": getattr(px.cred, "identity", {}).get("login")}
+               "identity": (px.gate.identity or {}).get("login")}
         if self.socks_target:
             rec["socks"] = True
         self.close_connection = True
@@ -395,6 +415,7 @@ class Handler(BaseHTTPRequestHandler):
                 host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]").lower()
                 path, _, query = target.partition("?")
             rec.update(host=host, path=path)
+            git = host == cfg.git_host     # git shows a text/plain refusal body; JSON it drops
             # The stdlib parser stops at a line it cannot read as a header and keeps the rest as
             # "payload", silently dropping those headers. Anything left over is a malformed request.
             if self.headers.defects or self.headers.get_payload() \
@@ -414,6 +435,9 @@ class Handler(BaseHTTPRequestHandler):
                 rec.update(decision="local", status=200)
                 return
 
+            # One credential for the whole request, taken before any body is read: a lock that
+            # lands later lets this request finish and refuses the next.
+            cred = px.cred
             if any(h in self.headers for h in METHOD_OVERRIDE):
                 raise Refused(400, "method-override headers are not accepted")
             if query and self.command not in policy.READ_METHODS and host == cfg.api_host:
@@ -423,7 +447,6 @@ class Handler(BaseHTTPRequestHandler):
 
             body, length = body_reader(self)
             if host == cfg.git_host:
-                git = True
                 rec["query"] = query
                 d = policy.git_request(pol, self.command, path, query)
                 if d.allow and path.endswith("/git-receive-pack"):
@@ -463,19 +486,20 @@ class Handler(BaseHTTPRequestHandler):
             if not d.allow:
                 raise Refused(403, d.reason, d.repo, d.detail)
             if d.lookup:
-                px.resolve_lookup(d)
+                px.resolve_lookup(d, cred)
             scope = px.scope(d.repo)
             perms = px.perms(d.access)
             self.deadline_at = None
             self.connection.settimeout(CLIENT_TIMEOUT)   # writes use it too; drop the residual deadline
             try:
-                auth = px.cred.git_authorization(scope, perms) if git else px.cred.authorization(scope, perms)
+                auth = cred.git_authorization(scope, perms) if git else cred.authorization(scope, perms)
             except (credentials.UpstreamError, KeyError, ValueError) as e:
                 raise Refused(502, f"could not mint a credential: {e.__class__.__name__}", d.repo)
+            px.gate.touch()
             status, sent = px.forward(self, upstream, path, query, body, length, auth)
             rec.update(decision="allow", status=status, bytes_out=sent)
         except Refused as r:
-            rec.update(decision="deny", status=r.status, reason=r.reason,
+            rec.update(decision="locked" if r.status == LOCKED_STATUS else "deny", status=r.status, reason=r.reason,
                        **({"repo": r.repo} if r.repo else {}), **({"detail": r.detail} if r.detail else {}))
             try:
                 self._refuse(r.status, r.reason, git)
@@ -573,45 +597,116 @@ class UnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
         pass
 
 
-def _systemd_socket():
-    """A listening socket passed by systemd socket activation, if any."""
-    if os.environ.get("LISTEN_PID") != str(os.getpid()) or os.environ.get("LISTEN_FDS") != "1":
-        return None
+_inherited: dict | None = None
+
+
+def _systemd_sockets() -> dict:
+    """Listening sockets passed by systemd socket activation, by name: {"data": s, "admin": s}.
+
+    One socket is the data socket whatever its name; with two, the one named "admin"
+    (FileDescriptorName=admin) is the admin socket.
+    """
+    global _inherited
+    if _inherited is not None:
+        return _inherited
+    _inherited = {}
+    n = os.environ.get("LISTEN_FDS")
+    if os.environ.get("LISTEN_PID") != str(os.getpid()) or n not in ("1", "2"):
+        return _inherited
+    names = (os.environ.get("LISTEN_FDNAMES") or "").split(":")
     for k in ("LISTEN_PID", "LISTEN_FDS", "LISTEN_FDNAMES"):
         os.environ.pop(k, None)
-    return socket.socket(fileno=3)
+    if n == "1":
+        _inherited["data"] = socket.socket(fileno=3)
+        return _inherited
+    if sorted(names) != ["admin", "data"]:
+        raise SystemExit(f"two activated sockets need FileDescriptorName=data and =admin, got {names}")
+    for i, name in enumerate(names):
+        _inherited[name] = socket.socket(fileno=3 + i)
+    return _inherited
 
 
-def bind(cfg: Config, proxy: Proxy) -> UnixServer:
-    inherited = _systemd_socket()
-    if inherited is not None:
-        srv = UnixServer(cfg.socket, Handler, bind_and_activate=False)
-        srv.socket.close()
-        srv.socket = inherited
-        srv.proxy = proxy
-        return srv
-    path = cfg.socket
+def _listen(server_cls, path, handler, mode, group=None):
     if os.path.lexists(path):
         if not stat.S_ISSOCK(os.lstat(path).st_mode):
             raise SystemExit(f"{path} exists and is not a socket; refusing to replace it")
         os.unlink(path)
     old = os.umask(0o177)
     try:
-        srv = UnixServer(path, Handler)
+        srv = server_cls(path, handler)
     finally:
         os.umask(old)
-    if cfg.socket_group:
-        os.chown(path, -1, grp.getgrnam(cfg.socket_group).gr_gid)
-    os.chmod(path, cfg.socket_mode)
+    if group:
+        os.chown(path, -1, grp.getgrnam(group).gr_gid)
+    os.chmod(path, mode)
+    return srv
+
+
+def _adopt(server_cls, path, handler, sock):
+    srv = server_cls(path, handler, bind_and_activate=False)
+    srv.socket.close()
+    srv.socket = sock
+    return srv
+
+
+def bind(cfg: Config, proxy: Proxy) -> UnixServer:
+    inherited = _systemd_sockets().get("data")
+    if inherited is not None:
+        srv = _adopt(UnixServer, cfg.socket, Handler, inherited)
+    else:
+        srv = _listen(UnixServer, cfg.socket, Handler, cfg.socket_mode, cfg.socket_group)
     srv.proxy = proxy
+    return srv
+
+
+def not_dumpable():
+    """No core dump, and no ptrace from other processes running as the service user."""
+    import ctypes
+    PR_SET_DUMPABLE = 4
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) != 0:
+        raise SystemExit(f"prctl(PR_SET_DUMPABLE) failed: errno {ctypes.get_errno()}")
+
+
+def bind_admin(cfg: Config, gate) -> unlock.AdminServer:
+    """The admin socket. Socket-activated, it is created by systemd with the operator as owner;
+    otherwise it is bound here, 0600, owned by whoever runs the proxy."""
+    acts = _systemd_sockets()
+    if "admin" in acts:
+        srv = _adopt(unlock.AdminServer, cfg.admin_socket, unlock.AdminHandler, acts["admin"])
+    elif acts:
+        raise SystemExit("unlock is configured but systemd passed no admin socket; "
+                         "enable airlock-cred-proxy-admin@<name>.socket")
+    else:
+        # Bound here it is owned by the proxy's own uid. airlock grants sockets owned by a
+        # system account, so that is only safe when the proxy runs as a login user.
+        if os.getuid() < client.login_uid_min():
+            raise SystemExit("run as a system account, the admin socket must come from systemd "
+                             "(airlock-cred-proxy-admin@<name>.socket), owned by the operator")
+        srv = _listen(unlock.AdminServer, cfg.admin_socket, unlock.AdminHandler, 0o600)
+    srv.gate, srv.path = gate, cfg.admin_socket
     return srv
 
 
 def serve(cfg: Config):
     audit = AuditLog(cfg.audit_log)
-    cred = credentials.build(cfg)
-    srv = bind(cfg, Proxy(cfg, cred, audit))
-    audit.write({"ts": now(), "event": "start", "identity": cred.identity.get("login"), "socket": cfg.socket})
+    threads = []
+    if cfg.unlock is None and "admin" in _systemd_sockets():
+        raise SystemExit("systemd passed an admin socket but the config has no [unlock] table")
+    if cfg.unlock is not None:
+        not_dumpable()
+        gate = unlock.UnlockGate(cfg, audit)
+        admin = bind_admin(cfg, gate)
+        stop = threading.Event()
+        threads = [threading.Thread(target=admin.serve_forever, daemon=True),
+                   threading.Thread(target=gate.run_timer, args=(stop,), daemon=True)]
+    else:
+        gate = unlock.StaticGate(credentials.build(cfg))
+    srv = bind(cfg, Proxy(cfg, gate, audit))
+    for t in threads:
+        t.start()
+    audit.write({"ts": now(), "event": "start", "identity": (gate.identity or {}).get("login"),
+                 "socket": cfg.socket, "state": gate.status()["state"]})
     try:
         srv.serve_forever()
     finally:

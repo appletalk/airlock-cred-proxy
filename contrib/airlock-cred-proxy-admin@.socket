@@ -1,0 +1,18 @@
+# Admin socket for an instance whose credential is delivered by `airlock-cred-proxy unlock`.
+# Design: docs/unlock.md. Owned by root and 0600 until the owner.conf drop-in names the
+# operator; airlock refuses to grant a socket the operator owns, so a box never gets it.
+# systemctl enable --now airlock-cred-proxy-admin@board.socket
+[Unit]
+Description=airlock-cred-proxy admin socket (%i)
+
+[Socket]
+ListenStream=/run/airlock-cred-proxy/%i.admin.sock
+FileDescriptorName=admin
+Service=airlock-cred-proxy@%i.service
+SocketUser=root
+SocketMode=0600
+DirectoryMode=0755
+Accept=no
+
+[Install]
+WantedBy=sockets.target

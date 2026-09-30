@@ -1,5 +1,6 @@
 """Configuration: one identity and one policy per proxy instance."""
 import os
+import re
 import tomllib
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
@@ -32,6 +33,11 @@ SAFE_MUTATIONS = DEFAULT_MUTATIONS | frozenset({
 DEFAULT_READ_PATHS = ("/rate_limit", "/meta", "/zen", "/users/*")
 
 ACCESS_LEVELS = ("read", "write")
+
+TIERS = ("day",)
+MAX_DAY_LIFETIME = 24 * 3600
+PASS_ENTRY = re.compile(r"[A-Za-z0-9_@+][A-Za-z0-9._@+-]*(?:/[A-Za-z0-9_@+][A-Za-z0-9._@+-]*)*")
+DURATION = re.compile(r"(?:\d+[dhms])+")
 
 
 class ConfigError(ValueError):
@@ -83,8 +89,16 @@ class Policy:
 
 
 @dataclass
+class Unlock:
+    max_lifetime: int
+    expire_at: tuple[int, int] | None
+    idle: int | None
+
+
+@dataclass
 class Config:
     socket: str
+    admin_socket: str
     socket_mode: int
     socket_group: str | None
     audit_log: str
@@ -98,7 +112,17 @@ class Config:
     installation_id: int | None
     key_source: dict
     token_source: dict
+    tier: str
+    unlock: Unlock | None
     policy: Policy = field(repr=False)
+
+    @property
+    def secret_source(self) -> dict:
+        return self.key_source if self.kind == "github-app" else self.token_source
+
+    @property
+    def pass_entry(self) -> str | None:
+        return self.secret_source.get("pass")
 
 
 def _bool(table: dict, key: str, default: bool) -> bool:
@@ -124,15 +148,57 @@ def _need(table: dict, key: str, where: str):
     return table[key]
 
 
+def valid_pass_entry(v) -> bool:
+    """Every segment starts with a letter, digit or _@+, so no option, no dot-file and no '..'."""
+    return isinstance(v, str) and bool(PASS_ENTRY.fullmatch(v))
+
+
 def _source(value, where: str) -> dict:
     if not isinstance(value, dict) or len(value) != 1:
-        raise ConfigError(f"{where} must be one of {{command=[...]}}, {{file=...}}, {{systemd_credential=...}}")
+        raise ConfigError(f"{where} must be one of {{command=[...]}}, {{file=...}}, {{systemd_credential=...}}, {{pass=...}}")
     (k, v), = value.items()
     if k == "command" and isinstance(v, list) and v and all(isinstance(x, str) for x in v):
         return value
     if k in ("file", "systemd_credential") and isinstance(v, str) and v:
         return value
+    if k == "pass":
+        if not valid_pass_entry(v):
+            raise ConfigError(f"{where}: pass entry {v!r} must be /-separated segments of letters, digits "
+                              "and ._@+-, each starting with a letter, digit or _@+")
+        return value
     raise ConfigError(f"{where}: bad {k!r}")
+
+
+def parse_duration(v, where: str) -> int:
+    if not isinstance(v, str) or not DURATION.fullmatch(v):
+        raise ConfigError(f"{where} must be a duration such as \"10h\", \"90m\" or \"1h30m\", not {v!r}")
+    secs = sum(int(n) * {"d": 86400, "h": 3600, "m": 60, "s": 1}[u] for n, u in re.findall(r"(\d+)([dhms])", v))
+    if secs <= 0:
+        raise ConfigError(f"{where} must be longer than zero")
+    return secs
+
+
+def _unlock(table) -> Unlock:
+    if not isinstance(table, dict):
+        raise ConfigError("[unlock] must be a table")
+    unknown = set(table) - {"max_lifetime", "expire_at", "idle"}
+    if unknown:
+        raise ConfigError(f"[unlock] has unknown keys: {', '.join(sorted(unknown))}")
+    life = parse_duration(_need(table, "max_lifetime", "unlock"), "unlock.max_lifetime")
+    if life > MAX_DAY_LIFETIME:
+        raise ConfigError("unlock.max_lifetime must not exceed 24h for a day credential")
+    at = None
+    if "expire_at" in table:
+        m = re.fullmatch(r"([01][0-9]|2[0-3]):([0-5][0-9])", str(table["expire_at"]))
+        if not isinstance(table["expire_at"], str) or not m:
+            raise ConfigError(f"unlock.expire_at must be local time HH:MM, not {table['expire_at']!r}")
+        at = (int(m[1]), int(m[2]))
+    idle = parse_duration(table["idle"], "unlock.idle") if "idle" in table else None
+    return Unlock(max_lifetime=life, expire_at=at, idle=idle)
+
+
+def default_admin_socket(sock: str) -> str:
+    return (sock[:-5] if sock.endswith(".sock") else sock) + ".admin.sock"
 
 
 def parse(data: dict) -> Config:
@@ -179,8 +245,13 @@ def parse(data: dict) -> Config:
 
     api_url = server.get("api_url", "https://api.github.com")
     git_url = server.get("git_url", "https://github.com")
+    tier = ident.get("tier", "day")
+    if tier not in TIERS:
+        raise ConfigError(f"identity.tier must be one of {', '.join(TIERS)}, not {tier!r}")
+    sock = _need(server, "socket", "server")
     cfg = Config(
-        socket=_need(server, "socket", "server"),
+        socket=sock,
+        admin_socket=server.get("admin_socket", default_admin_socket(sock)),
         socket_mode=int(str(server.get("socket_mode", "0660")), 8),
         socket_group=server.get("socket_group"),
         audit_log=server.get("audit_log", "-"),
@@ -194,8 +265,16 @@ def parse(data: dict) -> Config:
         installation_id=int(ident["installation_id"]) if ident.get("installation_id") else None,
         key_source=_source(ident["key"], "identity.key") if kind == "github-app" else {},
         token_source=_source(ident["token"], "identity.token") if kind == "token" else {},
+        tier=tier,
+        unlock=_unlock(data["unlock"]) if "unlock" in data else None,
         policy=policy,
     )
+    if cfg.pass_entry and cfg.unlock is None:
+        raise ConfigError("a pass source is delivered at unlock time and needs an [unlock] table")
+    if cfg.unlock is not None and not cfg.pass_entry:
+        raise ConfigError("[unlock] needs the identity's key or token to be a pass source")
+    if cfg.admin_socket == cfg.socket:
+        raise ConfigError("server.admin_socket must differ from server.socket")
     if kind == "github-app" and not (cfg.app_id and cfg.owner and "key" in ident):
         raise ConfigError("github-app identity needs app_id, owner and key")
     # A token identity cannot be narrowed at mint time, so project mutations without a board
@@ -212,8 +291,9 @@ def parse(data: dict) -> Config:
             raise ConfigError(f"repos outside the installation owner {cfg.owner!r}: {', '.join(stray)}")
     if any("/" not in r for r in cfg.policy.repos if r != "*"):
         raise ConfigError("policy.repos entries must be owner/name")
-    if len(cfg.socket.encode()) > 107:
-        raise ConfigError("server.socket path is longer than the 107-byte Unix socket limit")
+    for name in ("socket", "admin_socket"):
+        if len(getattr(cfg, name).encode()) > 107:
+            raise ConfigError(f"server.{name} path is longer than the 107-byte Unix socket limit")
     return cfg
 
 
@@ -226,6 +306,8 @@ def read_source(src: dict) -> str:
     """Resolve a secret source to its text. The caller keeps it in memory only."""
     import subprocess
     (k, v), = src.items()
+    if k == "pass":
+        raise ConfigError("a pass source is delivered by 'airlock-cred-proxy unlock', not read by the proxy")
     if k == "command":
         r = subprocess.run(v, capture_output=True, text=True, timeout=60)
         if r.returncode:

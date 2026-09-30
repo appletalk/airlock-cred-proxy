@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -81,6 +82,16 @@ class Handler(BaseHTTPRequestHandler):
         if tok not in st.tokens:
             return self._json(401, {"message": "bad credentials"})
 
+        if path == "/user":
+            return self._json(200, {"id": 5151, "login": "token-user"})
+        if path.endswith("/marker"):
+            self.send_response(200)
+            self.send_header("X-Airlock-Cred-Proxy", "locked")
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            return self.wfile.write(b"{}")
+        if path.endswith("/slow"):
+            time.sleep(getattr(st, "delay", 0))
         if path.startswith("/users/"):
             return self._json(200, {"id": 4242, "login": path[7:]})
         m = re.fullmatch(r"/repos/([^/]+/[^/]+)/pulls/(\d+)", path)

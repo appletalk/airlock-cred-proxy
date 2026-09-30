@@ -103,6 +103,21 @@ whenever it creates the socket: `contrib/socket-uid-acl.conf.example` is a drop-
 the `.socket` unit that does this. Mount the socket file itself into the container,
 read-only; the proxy's whole security model assumes the agent holds nothing else.
 
+## Unlock for the day
+
+A credential can instead live in `pass` and reach the proxy only when the operator unlocks
+it on the host, for a bounded time:
+
+```
+airlock-cred-proxy unlock          # reads only the pass entries the proxies name; one gpg prompt
+airlock-cred-proxy lock            # drop it now
+```
+
+Until then, and after the deadline (`max_lifetime`, `expire_at`, `idle`), every request gets
+HTTP 423 with `X-Airlock-Cred-Proxy: locked`. The admin socket that takes the secret is owned
+by the operator, so airlock never grants it to a box. Design, boundary and systemd setup:
+[docs/unlock.md](docs/unlock.md).
+
 ## Identities
 
 - `kind = "github-app"`: the recommended identity. Tokens are minted per request and

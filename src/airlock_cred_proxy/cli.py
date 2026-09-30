@@ -1,15 +1,19 @@
 """airlock-cred-proxy command line."""
 import argparse
 import collections
+import glob
 import json
 import os
 import re
+import subprocess
 import sys
 from urllib.parse import urlsplit
 
 from . import __version__, client, config
 
 UNPRINTABLE = re.compile(r"[^\x20-\x7e]")
+ADMIN_GLOB = "/run/airlock-cred-proxy/*.admin.sock"
+SHORT_UNLOCK = 30 * 60
 
 
 def _safe(v) -> str:
@@ -44,6 +48,15 @@ def cmd_check(a):
     print(f"  REST       {'writes allowed by rule' if p.rest_writes else 'reads only'}")
     if cfg.kind == "token":
         print("  note       token identities cannot be narrowed by repo for GraphQL queries; see README")
+    if cfg.unlock is not None:
+        u = cfg.unlock
+        print(f"  unlock     pass entry {cfg.pass_entry}, tier {cfg.tier}, max {u.max_lifetime}s"
+              + (f", expires at {u.expire_at[0]:02d}:{u.expire_at[1]:02d}" if u.expire_at else "")
+              + (f", idle {u.idle}s" if u.idle else ""))
+        print(f"  admin      {cfg.admin_socket}")
+        if a.resolve:
+            print("credential not resolved: it is delivered by 'airlock-cred-proxy unlock'")
+            return
     if a.resolve:
         from . import credentials
         cred = credentials.build(cfg)
@@ -83,11 +96,21 @@ def cmd_explain(a):
 def cmd_status(a):
     try:
         h = client.local_get(a.socket, "/_airlock-cred-proxy/health")
-        i = client.local_get(a.socket, "/_airlock-cred-proxy/identity")
+        try:
+            i = client.local_get(a.socket, "/_airlock-cred-proxy/identity")
+            who = f"{i['login']} (id {i['id']}) api={i['api_host']} git={i['git_host']}"
+        except client.LockedError:
+            who = "no identity yet"
     except (OSError, RuntimeError) as e:
         print(f"proxy unreachable at {a.socket}: {e}", file=sys.stderr)
         return 1
-    print(f"{h['status']}: {i['login']} (id {i['id']}) api={i['api_host']} git={i['git_host']}")
+    state = h.get("state", "static")
+    if state == "unlocked":
+        state += f" until {h.get('expires_at')} ({h.get('expires_in', 0) // 60} min left)"
+    elif state == "locked":
+        state += f" ({h.get('reason')}); unlock on the host with 'airlock-cred-proxy unlock'"
+    print(f"{h['status']}: {who}\n  credential {state}")
+    return 3 if h.get("state") == "locked" else 0
 
 
 def cmd_env(a):
@@ -97,6 +120,80 @@ def cmd_env(a):
         print(f"proxy unreachable at {a.socket}: {e}", file=sys.stderr)
         return 1
     sys.stdout.write(client.shell_exports(env))
+    if not env["GIT_AUTHOR_NAME"]:
+        print("airlock-cred-proxy: credential locked since the proxy started; git and gh are routed "
+              "through it but commits are refused until it is unlocked on the host", file=sys.stderr)
+
+
+def _admin_sockets(a):
+    return a.socket or sorted(glob.glob(ADMIN_GLOB))
+
+
+def _instance(sock):
+    b = os.path.basename(sock)
+    return b[:-len(".admin.sock")] if b.endswith(".admin.sock") else b
+
+
+def _read_pass(entry):
+    # The entry name comes from the proxy's config; check it again before it reaches argv.
+    if not config.valid_pass_entry(entry):
+        raise RuntimeError(f"proxy asked for an invalid pass entry {entry!r}")
+    r = subprocess.run(["pass", "show", entry], stdout=subprocess.PIPE, text=True)
+    if r.returncode:
+        raise RuntimeError(f"'pass show {entry}' exited {r.returncode}")
+    return r.stdout
+
+
+def cmd_unlock(a):
+    socks = _admin_sockets(a)
+    if not socks:
+        print(f"no admin sockets match {ADMIN_GLOB}; name one with --socket", file=sys.stderr)
+        return 1
+    for_s = config.parse_duration(a.for_, "--for") if a.for_ else None
+    read, rc = {}, 0      # entry -> secret, so an entry two instances share is read once
+    try:
+        for sock in socks:
+            name = _instance(sock)
+            try:
+                st, info = client.admin_call(sock, "GET", "/status")
+                if st != 200:
+                    raise RuntimeError(info.get("error", f"HTTP {st}"))
+                secrets = {}
+                for e in info.get("entries") or []:
+                    if e not in read:
+                        read[e] = _read_pass(e)
+                    secrets[e] = read[e]
+                body = {"secrets": secrets, **({"for_seconds": for_s} if for_s else {})}
+                st, r = client.admin_call(sock, "POST", "/unlock", body)
+                if st != 200:
+                    raise RuntimeError(r.get("error", f"HTTP {st}"))
+                print(f"{name}: unlocked as {_safe(r.get('identity'))} until {_safe(r.get('expires_at'))}")
+                if r.get("expires_in", SHORT_UNLOCK) < SHORT_UNLOCK:
+                    print(f"{name}: note: that is under {SHORT_UNLOCK // 60} minutes away", file=sys.stderr)
+            except (OSError, RuntimeError) as e:
+                print(f"{name}: not unlocked: {_safe(e)}", file=sys.stderr)
+                rc = 1
+    finally:
+        read.clear()
+    return rc
+
+
+def cmd_lock(a):
+    socks = _admin_sockets(a)
+    if not socks:
+        print(f"no admin sockets match {ADMIN_GLOB}; name one with --socket", file=sys.stderr)
+        return 1
+    rc = 0
+    for sock in socks:
+        try:
+            st, r = client.admin_call(sock, "POST", "/lock")
+            if st != 200:
+                raise RuntimeError(r.get("error", f"HTTP {st}"))
+            print(f"{_instance(sock)}: {_safe(r.get('state'))}")
+        except (OSError, RuntimeError) as e:
+            print(f"{_instance(sock)}: not locked: {_safe(e)}", file=sys.stderr)
+            rc = 1
+    return rc
 
 
 def cmd_audit(a):
@@ -156,6 +253,15 @@ def main(argv=None):
     s.add_argument("--socket", required=True)
     s.add_argument("--gh-config-dir", default=os.path.join(sd, "gh"))
     s.set_defaults(fn=cmd_env)
+
+    s = sub.add_parser("unlock", help="on the host: deliver each proxy's pass entries so it can work until its expiry")
+    s.add_argument("--socket", action="append", help=f"admin socket (repeatable); default {ADMIN_GLOB}")
+    s.add_argument("--for", dest="for_", metavar="DURATION", help="unlock for less than the configured lifetime, e.g. 2h")
+    s.set_defaults(fn=cmd_unlock)
+
+    s = sub.add_parser("lock", help="on the host: drop the credential now")
+    s.add_argument("--socket", action="append", help=f"admin socket (repeatable); default {ADMIN_GLOB}")
+    s.set_defaults(fn=cmd_lock)
 
     s = sub.add_parser("audit", help="read the audit log")
     s.add_argument("--log", required=True)

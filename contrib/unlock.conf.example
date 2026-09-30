@@ -1,0 +1,28 @@
+# Drop-ins for an instance whose credential is delivered by `airlock-cred-proxy unlock`
+# (a pass source plus an [unlock] table in its config). Design: docs/unlock.md.
+# Replace YOUR_USER, and board with the instance name.
+#
+# 1. The admin socket belongs to the operator:
+#    /etc/systemd/system/airlock-cred-proxy-admin@board.socket.d/owner.conf
+#      [Socket]
+#      SocketUser=YOUR_USER
+#
+# 2. The data socket must carry FileDescriptorName=data, as contrib/airlock-cred-proxy@.socket
+#    does; an older installed copy needs it added.
+#
+# 3. The service takes both sockets and loads no key from disk:
+#    /etc/systemd/system/airlock-cred-proxy@board.service.d/unlock.conf
+[Unit]
+Requires=airlock-cred-proxy-admin@%i.socket
+After=airlock-cred-proxy-admin@%i.socket
+
+[Service]
+Sockets=airlock-cred-proxy@%i.socket airlock-cred-proxy-admin@%i.socket
+# An empty assignment clears the LoadCredential= inherited from the main unit.
+LoadCredential=
+
+# Then: sudo systemctl daemon-reload
+#       sudo systemctl enable --now airlock-cred-proxy-admin@board.socket
+#       sudo systemctl restart airlock-cred-proxy@board.socket airlock-cred-proxy@board.service
+# Restarting the service or either socket locks the proxy; unlock again afterwards.
+# Remove /etc/airlock-cred-proxy/board.key if it exists: the point is that it does not.

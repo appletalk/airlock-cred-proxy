@@ -5,6 +5,8 @@ Description=airlock-cred-proxy socket (%i)
 
 [Socket]
 ListenStream=/run/airlock-cred-proxy/%i.sock
+# Tells it apart from the admin socket when unlock is configured; harmless otherwise.
+FileDescriptorName=data
 SocketUser=airlock-cred-proxy
 SocketGroup=airlock-cred-proxy-clients
 SocketMode=0660
