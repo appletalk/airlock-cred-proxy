@@ -89,7 +89,11 @@ def cmd_status(a):
 
 
 def cmd_env(a):
-    env = client.environment(a.socket, a.gh_config_dir)
+    try:
+        env = client.environment(a.socket, a.gh_config_dir)
+    except (OSError, RuntimeError) as e:
+        print(f"proxy unreachable at {a.socket}: {e}", file=sys.stderr)
+        return 1
     sys.stdout.write(client.shell_exports(env))
 
 
@@ -163,6 +167,10 @@ def main(argv=None):
         return a.fn(a) or 0
     except config.ConfigError as e:
         print(f"config error: {e}", file=sys.stderr)
+        return 2
+    except ImportError as e:
+        print(f"gh-cred-proxy {a.cmd} needs the full install (pip install -r requirements.lock): {e}",
+              file=sys.stderr)
         return 2
 
 

@@ -2,6 +2,9 @@
 # the socket. Rootless containers keep the host user's uid but drop its supplementary
 # groups, so the socket group does not reach a box; the uid ACL does.
 #
+# Needs setfacl (the acl package): if it is missing, the socket unit fails to start, and
+# the service with it.
+#
 # Install (replace YOUR_USER, and otto with the instance name):
 #   sudo install -D -m 0644 socket-uid-acl.conf.example \
 #     /etc/systemd/system/gh-cred-proxy@otto.socket.d/uid-acl.conf
