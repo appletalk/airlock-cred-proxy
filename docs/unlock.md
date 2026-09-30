@@ -302,19 +302,31 @@ GitHub. Unlocking is a host operation in both.
 
 ## airlock gaps this design found
 
-These are airlock work, recorded here because the boundary above depends on them:
+These are airlock work, recorded here because the boundary above depends on them. Fixes
+are on claude-airlock's `boundary-guards` branch (2c7ea61), under review.
 
-- **Folder shares get none of `airlock mount`'s checks.** `_gate_shares` joins the share
-  base with the relpath from `.airlock/config` and tests it with `[ -d ]`, which follows
-  symlinks. There is no canonicalisation, deny list or `$HOME` limit, and `..` is not
-  refused. A box that can write in a `share_rw` directory can plant a symlink to
-  `/run/airlock-cred-proxy` and request it as a share. The prompt shows the unresolved path.
-  Shares need the mount checks, a resolved and stored target, and a refusal of any
-  directory that contains a socket.
-- **Directory mounts are not checked for sockets inside them.** An agent socket in an
-  ordinary directory (a custom `GNUPGHOME`, say) would ride in on a mount.
-- **airlock's `secrets` can inject any `pass` entry into a box**, including one a proxy
-  unlocks with. It should refuse entries that a proxy config names.
+- **Folder shares followed symlinks.** `_gate_shares` joined the share base with the relpath
+  from `.airlock/config` and tested it with `[ -d ]`, which follows symlinks; `..` and
+  absolute paths were already refused by the parser. A box that can write in a `share_rw`
+  directory could plant a symlink and request it as a share, and an approved path could be
+  swapped for one later. The worst targets are gpg-agent's socket directory (decrypt any
+  `pass` entry), ssh-agent, and `~/.password-store` or `~/.gnupg`, which only `airlock
+  mount` refused. This proxy's admin socket is a lesser target: with no secretless verb it
+  only allows a lock. Fix: every launch re-checks every share and skips any with a symlink
+  below the base.
+- **Shares and mounts could contain a key agent.** An agent socket in an ordinary directory
+  (a custom `GNUPGHOME`, `ssh-agent -a`) would ride in on a share or mount. Fix: refuse a
+  directory that overlaps the ssh agent socket, gpg's home or socket directory, or a
+  host-set `AIRLOCK_PROTECTED_PATHS` entry. The check is by path, so a socket created
+  after launch inside a protected location is still covered; a bind mount is live, so a
+  check that looked for sockets at launch would not be.
+- **airlock's `secrets` could inject any `pass` entry into a box**, including one a proxy
+  fronts. Fix: `AIRLOCK_SECRET_DENY` in airlock's host config, empty by default. airlock
+  does not depend on this proxy, so the list is set by the operator, not looked up.
+
+One gap is operational, not code: a box `secret` that injects the same token a proxy
+fronts (Otto's `GH_TOKEN = pass:github/gh_token`, 2026-09-30) defeats the proxy for that
+token until it is removed.
 
 ## Tests
 
