@@ -54,6 +54,8 @@ class Policy:
     repo_merge_denied_bases: dict[str, list[str]]
     mutations: frozenset[str]
     rest_allow: list[tuple[str, str]]
+    rest_writes: bool
+    projects: frozenset[str] | None
     read_paths: tuple[str, ...]
 
     def repo_allowed(self, full_name: str) -> bool:
@@ -153,6 +155,8 @@ def parse(data: dict) -> Config:
         repo_merge_denied_bases={n: list(t.get("merge_denied_bases", [])) for n, t in repo_tables.items()},
         mutations=frozenset(mutations) if mutations is not None else DEFAULT_MUTATIONS,
         rest_allow=[(m.upper(), p) for m, p in pol.get("rest_allow", [])],
+        rest_writes=bool(pol.get("rest_writes", True)),
+        projects=frozenset(pol["projects"]) if "projects" in pol else None,
         read_paths=tuple(pol.get("read_paths", DEFAULT_READ_PATHS)),
     )
 

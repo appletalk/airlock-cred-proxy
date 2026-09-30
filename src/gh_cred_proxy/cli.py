@@ -40,6 +40,8 @@ def cmd_check(a):
     print(f"  protected  {p.merge_denied_bases or 'none'}" +
           "".join(f"; {r}: {b}" for r, b in p.repo_merge_denied_bases.items()))
     print(f"  mutations  {len(p.mutations)} allowed" + (" (default set)" if p.mutations == config.DEFAULT_MUTATIONS else ""))
+    print(f"  projects   {', '.join(sorted(p.projects)) if p.projects is not None else 'any (not pinned)'}")
+    print(f"  REST       {'writes allowed by rule' if p.rest_writes else 'reads only'}")
     if cfg.kind == "token":
         print("  note       token identities cannot be narrowed by repo for GraphQL queries; see README")
     if a.resolve:

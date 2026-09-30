@@ -151,6 +151,49 @@ class ReviewRound2(unittest.TestCase):
         self.assertFalse(policy._too_deep('query { a(x: "' + "{" * 200 + '") { b } }'))
 
 
+def gql(query, variables=None):
+    import json
+    return json.dumps({"query": query, "variables": variables or {}}).encode()
+
+
+class BoardIdentity(unittest.TestCase):
+    """A token identity pinned to one project board, with REST writes off."""
+
+    def board(self, **over):
+        return pol(graphql_mutations=["updateProjectV2ItemFieldValue", "addProjectV2ItemById"],
+                   projects=["PVT_board"], rest_writes=False, **over)
+
+    def test_project_mutation_on_the_allowed_board(self):
+        q = 'mutation { updateProjectV2ItemFieldValue(input:{projectId:"PVT_board", itemId:"I", fieldId:"F", value:{date:"2030-01-01"}}) { clientMutationId } }'
+        self.assertTrue(policy.graphql_request(self.board(), gql(q)).allow)
+
+    def test_project_mutation_on_another_board_refused(self):
+        q = 'mutation { updateProjectV2ItemFieldValue(input:{projectId:"PVT_other", itemId:"I", fieldId:"F", value:{date:"2030-01-01"}}) { clientMutationId } }'
+        self.assertFalse(policy.graphql_request(self.board(), gql(q)).allow)
+
+    def test_project_id_through_variables_and_defaults(self):
+        q = 'mutation($p: ID!) { addProjectV2ItemById(input:{projectId:$p, contentId:"C"}) { item { id } } }'
+        self.assertTrue(policy.graphql_request(self.board(), gql(q, {"p": "PVT_board"})).allow)
+        self.assertFalse(policy.graphql_request(self.board(), gql(q, {"p": "PVT_other"})).allow)
+        q2 = 'mutation($p: ID! = "PVT_other") { addProjectV2ItemById(input:{projectId:$p, contentId:"C"}) { item { id } } }'
+        self.assertFalse(policy.graphql_request(self.board(), gql(q2)).allow)
+
+    def test_missing_project_id_refused(self):
+        q = 'mutation { addProjectV2ItemById(input:{contentId:"C"}) { item { id } } }'
+        self.assertFalse(policy.graphql_request(self.board(), gql(q)).allow)
+
+    def test_no_projects_key_means_no_pin(self):
+        q = 'mutation { addProjectV2ItemById(input:{projectId:"PVT_any", contentId:"C"}) { item { id } } }'
+        self.assertTrue(policy.graphql_request(pol(graphql_mutations=["addProjectV2ItemById"]), gql(q)).allow)
+
+    def test_rest_writes_off_refuses_writes_keeps_reads(self):
+        p = self.board()
+        self.assertFalse(policy.rest_request(p, "POST", "/repos/acme/app/issues", b'{"title":"t"}').allow)
+        self.assertFalse(policy.rest_request(p, "PATCH", "/repos/acme/app/issues/1", b'{"state":"closed"}').allow)
+        self.assertTrue(policy.rest_request(p, "GET", "/repos/acme/app/issues/1", None).allow)
+        self.assertTrue(policy.rest_request(pol(), "POST", "/repos/acme/app/issues", b'{"title":"t"}').allow)
+
+
 class Config(unittest.TestCase):
     def test_unclassified_mutations_refused(self):
         for m in ("createLinkedBranch", "dismissPullRequestReview", "someFutureMutation"):

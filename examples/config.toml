@@ -30,3 +30,5 @@ merge_denied_bases = ["release/*"]           # added to the global list for this
 # graphql_mutations = ["createPullRequest", "addComment"]     # replaces the default allowlist
 # rest_allow = [["POST", "/repos/{owner}/{repo}/check-runs"]] # extra REST writes
 # read_paths = ["/rate_limit", "/meta", "/zen", "/users/*"]   # non-repo GETs
+# projects = ["PVT_kwDO..."]      # pin project (v2) mutations to these boards
+# rest_writes = false             # GraphQL only: refuse every REST write

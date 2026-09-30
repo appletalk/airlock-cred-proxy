@@ -254,6 +254,9 @@ def rest_request(policy: Policy, method: str, path: str, body: bytes | None) -> 
             return allow("read (non-repo path)")
         return deny("non-repo read path not in read_paths")
 
+    if not policy.rest_writes:
+        return deny("REST writes are disabled for this identity", repo=repo, access="write")
+
     for m, rx, kind in REST_WRITES:
         if m != method:
             continue
@@ -320,6 +323,10 @@ def _rest_check(policy: Policy, kind: str, repo: str, m, body: dict) -> Decision
 # ---------------------------------------------------------------- GraphQL
 
 REVIEW_MUTATIONS = {"addPullRequestReview", "submitPullRequestReview"}
+# Project (v2) mutations name their board in input.projectId; `projects` pins them.
+PROJECT_MUTATIONS = {"addProjectV2ItemById", "archiveProjectV2Item", "clearProjectV2ItemFieldValue",
+                     "deleteProjectV2Item", "unarchiveProjectV2Item", "updateProjectV2ItemFieldValue",
+                     "updateProjectV2ItemPosition"}
 UNRESOLVED = object()
 
 
@@ -449,6 +456,10 @@ def graphql_request(policy: Policy, body: bytes) -> Decision:
             inp = _input(sel, op_vars)
             if inp is UNRESOLVED:
                 return deny(f"{name}: could not resolve its input", detail={"mutations": fields})
+            if name in PROJECT_MUTATIONS and policy.projects is not None:
+                pid = inp.get("projectId")
+                if not isinstance(pid, str) or pid not in policy.projects:
+                    return deny(f"{name}: project {pid!r} is not in policy.projects", detail={"mutations": fields})
             if name in REVIEW_MUTATIONS and policy.deny_approvals:
                 event = inp.get("event")
                 if not isinstance(event, (str, type(None))) or (event or "").upper() == "APPROVE":

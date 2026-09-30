@@ -12,6 +12,8 @@ MUTANTS = [
  ("REST merge lookup", "server.py", 'if d.lookup:\n                px.resolve_lookup(d)', 'if False:\n                pass'),
  ("per-repo token scope", "server.py", '        return (name,)', '        return None'),
  ("repo allowlist", "config.py", 'return full_name.lower() in {r.lower() for r in self.repos}', 'return True'),
+ ("project pin", "policy.py", 'if name in PROJECT_MUTATIONS and policy.projects is not None:', 'if False:'),
+ ("rest_writes switch", "policy.py", 'if not policy.rest_writes:', 'if False:'),
  ("mutation allowlist", "policy.py", 'if name not in policy.mutations:', 'if False:'),
  ("graphql retarget check", "policy.py", 'lookups.append({"id": pr, "base": normalise_branch(base)})', 'pass'),
  ("auto-merge out of defaults", "config.py", '"markPullRequestReadyForReview", "mergePullRequest",', '"markPullRequestReadyForReview", "mergePullRequest", "enablePullRequestAutoMerge",'),
