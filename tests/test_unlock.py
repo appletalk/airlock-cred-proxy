@@ -519,6 +519,19 @@ class EndToEnd(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "systemd"):
                 server.bind_admin(self.cfg, self.gate)
 
+    def test_refusal_reaches_a_client_still_sending_its_body(self):
+        # A large body the server has not read when it refuses: without reading it first,
+        # the client's write fails with a broken pipe and never sees the 403.
+        os.chmod(self.admin, 0o660)
+        try:
+            for _ in range(5):
+                st, reply = client.admin_call(self.admin, "POST", "/unlock",
+                                              {"secrets": {"github/app.pem": "x" * 250000}})
+                self.assertEqual(st, 403)
+                self.assertIn("0600", reply["error"])
+        finally:
+            os.chmod(self.admin, 0o600)
+
     def test_admin_socket_is_created_0600(self):
         self.assertEqual(stat.S_IMODE(os.stat(self.admin).st_mode), 0o600)
 

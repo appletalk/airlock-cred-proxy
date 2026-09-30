@@ -241,6 +241,12 @@ class AdminHandler(BaseHTTPRequestHandler):
         gate: UnlockGate = self.server.gate
         self.close_connection = True
         rec = {"event": "admin", "method": self.command, "path": self.path, "peer_uid": self._peer_uid()}
+        # Read a well-framed body before deciding anything: a reply sent while the client is
+        # still writing reaches it as a broken pipe instead of the reason for the refusal.
+        self._body = None
+        n = self.headers.get("Content-Length", "")
+        if not self.headers.get("Transfer-Encoding") and n.isdigit() and int(n) <= ADMIN_MAX_BODY:
+            self._body = self.rfile.read(int(n))
         try:
             why = self._authorised()
             if why:
@@ -262,12 +268,11 @@ class AdminHandler(BaseHTTPRequestHandler):
             gate._log(**rec)
 
     def _unlock(self, gate, rec):
-        n = self.headers.get("Content-Length", "")
-        if self.headers.get("Transfer-Encoding") or not n.isdigit() or int(n) > ADMIN_MAX_BODY:
+        if self._body is None:
             rec.update(decision="deny", reason="unlock needs a Content-Length body under the limit")
             return self._reply(400, {"error": rec["reason"]})
         try:
-            req = json.loads(self.rfile.read(int(n)))
+            req = json.loads(self._body)
             secret = req["secrets"][gate.cfg.pass_entry]
             for_s = req.get("for_seconds")
             if not isinstance(secret, str) or not secret.strip():
