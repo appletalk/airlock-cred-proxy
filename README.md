@@ -91,6 +91,15 @@ gh-cred-proxy audit --log /var/log/gh-cred-proxy/app.jsonl --summary
 A refused `git push` shows only `HTTP 403` on the client, because git does not print
 error bodies for push requests. The reason is in the audit log.
 
+## Containers
+
+Agents in rootless containers (podman keep-id, for example) run as your uid, but the
+user namespace drops your supplementary groups, so membership in the socket's group does
+not carry into the box. Grant the uid with an ACL instead, and have systemd re-apply it
+whenever it creates the socket: `contrib/socket-uid-acl.conf.example` is a drop-in for
+the `.socket` unit that does this. Mount the socket file itself into the container,
+read-only; the proxy's whole security model assumes the agent holds nothing else.
+
 ## Identities
 
 - `kind = "github-app"`: the recommended identity. Tokens are minted per request and

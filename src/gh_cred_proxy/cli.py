@@ -7,7 +7,7 @@ import re
 import sys
 from urllib.parse import urlsplit
 
-from . import __version__, client, config, policy
+from . import __version__, client, config
 
 UNPRINTABLE = re.compile(r"[^\x20-\x7e]")
 
@@ -52,6 +52,7 @@ def cmd_check(a):
 
 
 def cmd_explain(a):
+    from . import policy        # needs graphql-core; the client commands must not
     cfg = config.load(a.config)
     u = urlsplit(a.url)
     host, path, query = (u.hostname or "").lower(), u.path or "/", u.query
