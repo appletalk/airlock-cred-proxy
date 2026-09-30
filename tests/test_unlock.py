@@ -357,6 +357,11 @@ class EndToEnd(unittest.TestCase):
         st, h, _ = self.api("POST", "/graphql", body=b'{"query":"{viewer{login}}"}')
         self.assertEqual(st, 423)
 
+    def test_locked_refusal_reaches_a_client_still_sending_its_body(self):
+        big = json.dumps({"title": "x" * 600000}).encode()
+        for _ in range(3):
+            self.assertEqual(self.api("POST", "/repos/acme/app/issues", body=big)[0], 423)
+
     def test_locked_wins_over_a_policy_refusal(self):
         # Checked before anything else about the request, so the agent is told to wait, not that it was wrong.
         st, _, _ = self.api("GET", "/repos/acme/elsewhere/pulls")

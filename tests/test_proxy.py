@@ -161,6 +161,15 @@ class ProxyTest(unittest.TestCase):
         status, _ = self.api("PUT", "/repos/acme/app/pulls/6/merge", {})
         self.assertEqual(status, 200)
 
+    def test_refusals_reach_a_client_still_sending_its_body(self):
+        # 600 KB the proxy has not read when it refuses: without reading it first, the
+        # client's write fails with a broken pipe instead of seeing the refusal.
+        big = {"config": {"x": "y" * 600000}}
+        for _ in range(3):
+            self.assertEqual(self.api("POST", "/repos/acme/app/hooks", big)[0], 403)          # policy, after the body reader opened
+            self.assertEqual(self.api("POST", "/repos/acme/app/issues", big,
+                                      headers={"X-HTTP-Method-Override": "DELETE"})[0], 400)  # before it
+
     def test_unknown_write_refused(self):
         status, _ = self.api("DELETE", "/repos/acme/app")
         self.assertEqual(status, 403)

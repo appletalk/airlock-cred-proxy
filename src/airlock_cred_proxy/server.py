@@ -24,6 +24,7 @@ from . import client, credentials, policy, unlock
 from .config import Config
 
 MAX_INSPECT = 1 << 20          # bodies the policy reads are buffered up to this size
+MAX_DRAIN = 1 << 20            # unread body read and discarded before a refusal is sent
 MAX_REF_SECTION = 1 << 20      # receive-pack command section
 MAX_CONNECTIONS = 64
 MAX_PER_PEER = 16              # connections one uid may hold, so one client cannot starve the rest
@@ -307,6 +308,7 @@ class Handler(BaseHTTPRequestHandler):
     sys_version = ""
     timeout = CLIENT_TIMEOUT
     socks_target = None
+    _body_it = None                # the request body's reader, once _handle has opened it
 
     def log_message(self, fmt, *args):
         pass
@@ -362,7 +364,28 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             return {}
 
-    def _refuse(self, status, reason, git):
+    def _drain(self):
+        """Read the rest of a well-framed request body, up to MAX_DRAIN, and discard it.
+
+        A refusal sent while the client is still writing its body reaches the client as a
+        broken pipe, not as the refusal. Bodies with bad framing, or larger than the cap,
+        still get the fast close.
+        """
+        try:
+            it = self._body_it
+            if it is None:
+                it, _ = body_reader(self)
+            n = 0
+            for b in it:
+                n += len(b)
+                if n > MAX_DRAIN:
+                    return
+        except (Refused, OSError, ValueError):
+            return
+
+    def _refuse(self, status, reason, git, drain=True):
+        if drain:
+            self._drain()
         msg = f"airlock-cred-proxy: {reason}"
         if git:
             data, ctype = (msg + "\n").encode(), "text/plain; charset=utf-8"
@@ -446,6 +469,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise Refused(400, "API paths do not end in /")
 
             body, length = body_reader(self)
+            self._body_it = body
             if host == cfg.git_host:
                 rec["query"] = query
                 d = policy.git_request(pol, self.command, path, query)
@@ -525,7 +549,7 @@ class Handler(BaseHTTPRequestHandler):
                                        "reason": message or "bad request"})
         self.close_connection = True
         try:
-            self._refuse(code, message or "bad request", False)
+            self._refuse(code, message or "bad request", False, drain=False)
         except OSError:
             pass
 
