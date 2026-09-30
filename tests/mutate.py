@@ -73,7 +73,7 @@ MUTANTS = [
  ("unlock: static config refuses an admin fd", "server.py", '    if cfg.unlock is None and "admin" in _systemd_sockets():', '    if False:'),
  ("unlock: activated unlock needs its admin fd", "server.py", '    elif acts:\n        raise SystemExit', '    elif False:\n        raise SystemExit'),
  ("unlock: for_seconds validation", "unlock.py", 'if for_s is not None and (not isinstance(for_s, int) or isinstance(for_s, bool) or for_s <= 0):', 'if False:'),
- ("unlock: admin refuses chunked", "unlock.py", 'if self.headers.get("Transfer-Encoding") or not n.isdigit()', 'if not n.isdigit()'),
+ ("unlock: admin refuses chunked", "unlock.py", 'if not self.headers.get("Transfer-Encoding") and n.isdigit() and int(n) <= ADMIN_MAX_BODY:', 'if n.isdigit() and int(n) <= ADMIN_MAX_BODY:'),
  ("unlock: client admin dir not writable by others", "client.py", '        if st.st_mode & 0o022 and (first or not st.st_mode & 0o1000):', '        if st.st_mode & 0o022 and not st.st_mode & 0o1000:'),
  ("unlock: for capped at max_lifetime", "unlock.py", '        d = now + min(for_seconds, u.max_lifetime)', '        d = min(d, now + for_seconds)'),
  ("unlock: DST-naive expire_at", "unlock.py", '            ts = time.mktime((at + dt.timedelta(days=1)).timetuple())', '            ts = ts + 86400'),
