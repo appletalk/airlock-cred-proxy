@@ -22,7 +22,10 @@ Sockets=airlock-cred-proxy@%i.socket airlock-cred-proxy-admin@%i.socket
 LoadCredential=
 
 # Then: sudo systemctl daemon-reload
+#       sudo systemctl stop airlock-cred-proxy@board.service
 #       sudo systemctl enable --now airlock-cred-proxy-admin@board.socket
-#       sudo systemctl restart airlock-cred-proxy@board.socket airlock-cred-proxy@board.service
+#       sudo systemctl start airlock-cred-proxy@board.service
+# Stop first: systemd refuses to start a socket whose service is already running
+# ("Socket service ... already active, refusing").
 # Restarting the service or either socket locks the proxy; unlock again afterwards.
 # Remove /etc/airlock-cred-proxy/board.key if it exists: the point is that it does not.
