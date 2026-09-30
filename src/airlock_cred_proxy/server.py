@@ -679,7 +679,8 @@ def bind_admin(cfg: Config, gate) -> unlock.AdminServer:
                          "enable airlock-cred-proxy-admin@<name>.socket")
     else:
         # Bound here it is owned by the proxy's own uid. airlock grants sockets owned by a
-        # system account, so that is only safe when the proxy runs as a login user.
+        # system account, so that is only safe when the proxy runs as a login user. The
+        # unlock CLI refuses such a socket (not root-served), so this path is for tests.
         if os.getuid() < client.login_uid_min():
             raise SystemExit("run as a system account, the admin socket must come from systemd "
                              "(airlock-cred-proxy-admin@<name>.socket), owned by the operator")

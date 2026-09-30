@@ -81,9 +81,10 @@ class Config(unittest.TestCase):
 
 
 class Deadline(unittest.TestCase):
+    # America/Vancouver has had no DST since 2026-11-01 (tzdata 2026d); New York still does.
     def setUp(self):
         self._tz = os.environ.get("TZ")
-        os.environ["TZ"] = "America/Vancouver"
+        os.environ["TZ"] = "America/New_York"
         time.tzset()
 
     def tearDown(self):
@@ -121,11 +122,36 @@ class Deadline(unittest.TestCase):
         t = self.at(2026, 9, 30, 18)
         self.assertEqual(unlock.deadline(t, self.cfg(expire_at="18:00")), t + 36000)
 
-    def test_expire_at_across_dst_stays_at_local_time(self):
-        # 2026-11-01 02:00 PDT -> 01:00 PST. Unlock the evening before with a 24h lifetime.
+    def assert_transition(self, before, after):
+        # Guard: without a real offset change this test would pass for any implementation.
+        self.assertNotEqual(time.localtime(before).tm_gmtoff, time.localtime(after).tm_gmtoff,
+                            "tzdata has no DST transition here; pick another date or zone")
+
+    def test_expire_at_across_fall_back_stays_at_local_time(self):
+        # 2026-11-01 02:00 EDT -> 01:00 EST. Unlock the evening before with a 24h lifetime.
         cfg = config.parse(base_cfg(unlock={"max_lifetime": "24h", "expire_at": "18:00"}))
-        d = unlock.deadline(self.at(2026, 10, 31, 20), cfg)
+        t = self.at(2026, 10, 31, 20)
+        d = unlock.deadline(t, cfg)
+        self.assert_transition(t, d)
         self.assertEqual(self.local(d), (2026, 11, 1, 18, 0))
+
+    def test_expire_at_across_spring_forward_stays_at_local_time(self):
+        cfg = config.parse(base_cfg(unlock={"max_lifetime": "24h", "expire_at": "18:00"}))
+        t = self.at(2027, 3, 13, 20)
+        d = unlock.deadline(t, cfg)
+        self.assert_transition(t, d)
+        self.assertEqual(self.local(d), (2027, 3, 14, 18, 0))
+
+    def test_expire_at_in_the_spring_forward_gap_resolves_an_hour_later(self):
+        cfg = config.parse(base_cfg(unlock={"max_lifetime": "24h", "expire_at": "02:30"}))
+        t = self.at(2027, 3, 13, 20)
+        d = unlock.deadline(t, cfg)
+        self.assert_transition(t, d)
+        self.assertEqual(self.local(d), (2027, 3, 14, 3, 30))
+
+    def test_huge_for_is_capped_not_an_overflow(self):
+        t = self.at(2026, 9, 30, 8)
+        self.assertEqual(unlock.deadline(t, self.cfg(), 10 ** 400), t + 36000)
 
     def test_for_shortens_and_cannot_lengthen(self):
         t = self.at(2026, 9, 30, 8)
@@ -198,6 +224,17 @@ class Gate(unittest.TestCase):
             self.gate.current()
         self.assertEqual(self.gate.identity, who)
 
+    def test_expiry_during_a_renewal_does_not_refuse_it(self):
+        gate = self.gate
+        gate.unlock("good")
+
+        def slow_build(cfg, secret):
+            self.now += 3600                 # the old unlock expires while GitHub is asked
+            gate.check()
+            return FakeCred(cfg, secret)
+        gate._build = slow_build
+        self.assertEqual(gate.unlock("good")["state"], "unlocked")
+
     def test_lock_during_unlock_check_wins(self):
         gate = self.gate
 
@@ -233,7 +270,9 @@ class Gate(unittest.TestCase):
         try:
             gate.unlock("good", for_seconds=1)
             self.assertIsNotNone(gate._cred)
-            time.sleep(1.6)
+            end = time.monotonic() + 10
+            while gate._cred is not None and time.monotonic() < end:
+                time.sleep(0.05)
             self.assertIsNone(gate._cred)     # read the field: status() or current() would lock it themselves
         finally:
             stop.set()
@@ -254,6 +293,7 @@ class EndToEnd(unittest.TestCase):
         cls.fake = fakegithub.start(cls.git_root)
         base = f"http://127.0.0.1:{cls.fake.server_port}"
         cls.key = pem()
+        cls.fake.state.app_public_key = serialization.load_pem_private_key(cls.key.encode(), None).public_key()
         cls.sock = os.path.join(cls.tmp, "p.sock")
         cls.admin = os.path.join(cls.tmp, "p.admin.sock")
         cls.audit_path = os.path.join(cls.tmp, "audit.jsonl")
@@ -262,7 +302,7 @@ class EndToEnd(unittest.TestCase):
                        "api_host": "api.github.com", "git_host": "github.com"},
             "identity": {"kind": "github-app", "app_id": 99, "owner": "acme", "key": {"pass": "github/app.pem"}},
             "policy": {"repos": ["acme/app"], "push_branches": ["agent/*"], "merge_denied_bases": ["main"]},
-            "unlock": {"max_lifetime": "1h"},
+            "unlock": {"max_lifetime": "1h", "idle": "1h"},
         })
         audit = server.AuditLog(cls.audit_path)
         cls.gate = unlock.UnlockGate(cls.cfg, audit)
@@ -349,6 +389,10 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(self.git("ls-remote", "https://github.com/acme/app.git").returncode, 0)
 
     def test_wrong_secret_stays_locked(self):
+        for secret in ("not a key", pem()):          # garbage, and a real key GitHub does not know
+            st, reply = self.do_unlock(secret)
+            self.assertEqual(st, 422, (secret[:20], reply))
+            self.assertEqual(reply["state"], "locked")
         st, reply = self.do_unlock("not a key")
         self.assertEqual(st, 422, reply)
         self.assertEqual(reply["state"], "locked")
@@ -373,6 +417,42 @@ class EndToEnd(unittest.TestCase):
                 self.assertNotEqual(st, 200, (host, method, path))
         self.assertEqual(self.gate.status()["state"], "locked")
 
+    def test_any_build_failure_is_a_clean_422(self):
+        with mock.patch.object(self.gate, "_build", side_effect=TypeError("encrypted key")):
+            st, reply = self.do_unlock()
+        self.assertEqual(st, 422)
+        self.assertEqual(reply["state"], "locked")
+
+    def test_huge_for_is_capped(self):
+        st, reply = client.admin_call(self.admin, "POST", "/unlock",
+                                      {"secrets": {"github/app.pem": self.key}, "for_seconds": 10 ** 400})
+        self.assertEqual(st, 200, reply)
+        self.assertLessEqual(reply["expires_in"], 3600)
+
+    def test_bad_for_seconds_refused(self):
+        for bad in (-5, 0, "3600", True, 1.5):
+            st, _ = client.admin_call(self.admin, "POST", "/unlock",
+                                      {"secrets": {"github/app.pem": self.key}, "for_seconds": bad})
+            self.assertEqual(st, 400, bad)
+        self.assertEqual(self.gate.status()["state"], "locked")
+
+    def test_chunked_unlock_refused(self):
+        c = client.UnixHTTPConnection(self.admin)
+        try:
+            body = json.dumps({"secrets": {"github/app.pem": self.key}}).encode()
+            c.request("POST", "/unlock", body=iter([body]), headers={"Host": "x"}, encode_chunked=True)
+            self.assertEqual(c.getresponse().status, 400)
+        finally:
+            c.close()
+        self.assertEqual(self.gate.status()["state"], "locked")
+
+    def test_allowed_request_resets_idle(self):
+        self.do_unlock()
+        self.gate._last_used -= 3000
+        self.assertLess(self.gate.status()["idle_lock_in"], 700)
+        self.assertEqual(self.api("GET", "/repos/acme/app/pulls")[0], 200)
+        self.assertGreater(self.gate.status()["idle_lock_in"], 3500)
+
     def test_lock_drops_minted_tokens(self):
         self.do_unlock()
         self.api("GET", "/repos/acme/app/pulls")
@@ -391,7 +471,9 @@ class EndToEnd(unittest.TestCase):
         t = threading.Thread(target=lambda: out.update(r=self.api("GET", "/repos/acme/app/slow")))
         t.start()
         try:
-            time.sleep(0.4)
+            end = time.monotonic() + 10       # lock only once the request is upstream
+            while not any(p.endswith("/slow") for _, p, _ in self.fake.state.seen) and time.monotonic() < end:
+                time.sleep(0.02)
             client.admin_call(self.admin, "POST", "/lock")
             t.join(10)
         finally:
@@ -472,6 +554,19 @@ class EndToEnd(unittest.TestCase):
         finally:
             s.close()
             os.unlink(fake)
+
+    def test_cli_refuses_a_socket_in_a_shared_writable_dir(self):
+        # /tmp is root-owned but world-writable: sticky or not, anyone could have made the socket.
+        mock.patch.stopall()
+        path = f"/tmp/acp-test-{os.getpid()}.admin.sock"
+        s = socket.socket(socket.AF_UNIX)
+        s.bind(path)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "writable by others"):
+                client.check_admin_path(path)
+        finally:
+            s.close()
+            os.unlink(path)
 
     def test_cli_refuses_a_symlinked_admin_socket(self):
         mock.patch.stopall()
@@ -560,6 +655,46 @@ print({k: v.getsockname().rsplit("/", 1)[1] for k, v in sorted(got.items())})
     def test_two_sockets_by_name(self):
         r = self.run_child("admin:data")
         self.assertEqual(r.stdout.strip(), "{'admin': 'a.sock', 'data': 'b.sock'}", r.stderr)
+
+    STRAY = r'''
+import os, socket, sys
+from airlock_cred_proxy import config, server
+d, mode = sys.argv[1], sys.argv[2]
+socks = []
+for n in ("a.sock", "b.sock"):
+    s = socket.socket(socket.AF_UNIX); s.bind(os.path.join(d, n)); s.listen(4); socks.append(s)
+os.dup2(socks[0].fileno(), 3); os.dup2(socks[1].fileno(), 4)
+if mode == "static":
+    os.environ.update(LISTEN_PID=str(os.getpid()), LISTEN_FDS="2", LISTEN_FDNAMES="data:admin")
+    cfg = config.parse({"server": {"socket": os.path.join(d, "a.sock"), "audit_log": os.path.join(d, "log")},
+                        "identity": {"kind": "token", "token": {"command": ["true"]}}, "policy": {"repos": ["*"]}})
+    server.serve(cfg)
+else:
+    os.environ.update(LISTEN_PID=str(os.getpid()), LISTEN_FDS="1")
+    cfg = config.parse({"server": {"socket": os.path.join(d, "a.sock")},
+                        "identity": {"kind": "token", "token": {"pass": "x"}}, "policy": {"repos": ["*"]},
+                        "unlock": {"max_lifetime": "1h"}})
+    server.bind_admin(cfg, None)
+'''
+
+    def run_stray(self, mode):
+        d = tempfile.mkdtemp(prefix="gcpa.", dir="/tmp")
+        try:
+            return subprocess.run([sys.executable, "-c", self.STRAY, d, mode], capture_output=True, text=True,
+                                  timeout=30, env={**os.environ, "PYTHONPATH": os.path.join(
+                                      os.path.dirname(__file__), "..", "src")})
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_static_config_refuses_an_admin_socket(self):
+        r = self.run_stray("static")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("no [unlock] table", r.stderr)
+
+    def test_unlock_config_needs_the_admin_socket_when_activated(self):
+        r = self.run_stray("unlock")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("passed no admin socket", r.stderr)
 
     def test_two_sockets_need_both_names(self):
         r = self.run_child("data:other")

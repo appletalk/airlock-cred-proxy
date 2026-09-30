@@ -122,7 +122,8 @@ def cmd_env(a):
     sys.stdout.write(client.shell_exports(env))
     if not env["GIT_AUTHOR_NAME"]:
         print("airlock-cred-proxy: credential locked since the proxy started; git and gh are routed "
-              "through it but commits are refused until it is unlocked on the host", file=sys.stderr)
+              "through it, but commits are refused until it is unlocked on the host and env is run again",
+              file=sys.stderr)
 
 
 def _admin_sockets(a):

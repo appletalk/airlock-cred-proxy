@@ -53,7 +53,9 @@ gpg-agent window, at the cost of a passphrase prompt per unlock. It is not done 
   owner, and refuses everyone if the socket's mode grants group or other access.
 - **Not grantable when bound by the proxy.** Outside systemd the proxy binds the admin
   socket itself, owned by its own uid. It refuses to do that when it runs as a system
-  account, because airlock grants sockets owned by system accounts.
+  account, because airlock grants sockets owned by system accounts. The `unlock` command
+  refuses a socket served by a login uid, so this mode is for tests only; real use is
+  socket-activated.
 - **No admin path on the data socket.** The data socket serves proxied requests and two
   read-only local paths (health, identity). Admin paths there are refused like any other.
 - **Unix sockets only.** Nothing listens on TCP. A box on a bridged network can reach host
@@ -94,10 +96,11 @@ board: unlocked as keith-phsa until 2026-09-30T18:00:00-0700
    so several instances cost one prompt.
 4. It sends the material over the admin socket. The proxy builds the credential and checks
    it against GitHub (the identity lookup it does at start today) before it reports
-   unlocked. A secret that does not work leaves the proxy as it was.
+   unlocked. A secret that does not work, for whatever reason, gets a clear refusal and
+   leaves the proxy as it was. The deadline is computed before anything is installed.
 
 `airlock-cred-proxy lock` locks every instance at once. `unlock --for 2h` unlocks for less
-than the configured lifetime, never more. Unlocking again while unlocked restarts the clock;
+than the configured lifetime, never more; a longer value is capped at the lifetime. Unlocking again while unlocked restarts the clock;
 it needs the secret, so that is not a way around the lifetime. `unlock` warns when the
 deadline it got is under 30 minutes away.
 
@@ -116,11 +119,14 @@ The proxy locks at whichever comes first:
 - the next `expire_at` strictly after the unlock. An unlock at exactly 18:00 rolls to
   tomorrow's 18:00, which the lifetime then caps;
 - `idle` since the last allowed, forwarded request. Health, identity and refused requests
-  do not count.
+  do not count. Idle is measured on the wall clock only, so setting the clock back delays
+  it; the boot-clock lifetime still bounds it.
 
 This covers the out-of-hours case: unlocking at 19:00 with `expire_at = "18:00"` locks at
 05:00, ten hours later, because the next 18:00 is further away. `expire_at` follows local
 time across DST changes. A time inside the spring-forward gap resolves an hour later.
+(British Columbia has had no DST since 2026-11-01, so for a Vancouver host this never
+applies; the tests use New York and fail if the zone they use stops changing.)
 
 The lifetime is checked on two clocks. The wall clock is read on every use, so a
 workstation that wakes from suspend is locked on its first request even if no timer has
@@ -138,8 +144,9 @@ runs in UTC while `expire_at` is the host's local time.
 Every proxied request gets **HTTP 423 Locked**, with the body
 `airlock-cred-proxy: credential locked (<reason>); unlock on the host with 'airlock-cred-proxy unlock'`
 and the header `X-Airlock-Cred-Proxy: locked`. The proxy strips that header from upstream
-responses, so GitHub cannot forge it. The lock is checked before anything else about the
-request, so a locked proxy answers 423 even to a request the policy would refuse. The audit
+responses, so GitHub cannot forge it. The lock is checked after the request's framing,
+headers and path are validated and before the policy runs, so a malformed request still
+gets 400 but a locked proxy answers 423 to a request the policy would refuse. The audit
 log records `decision: "locked"`.
 
 Tested with git 2.55 and gh 2.101: neither retries. git prints the body as `remote:` lines
@@ -154,7 +161,8 @@ The identity path answers with the identity from the last unlock, because it is 
 Before the first unlock since the proxy started, it returns 423. `env` then still routes
 git and gh through the proxy, so the lock shows up as 423 and nothing goes around the
 proxy. It sets an empty author and committer, so git refuses to commit instead of falling
-back to another identity, and it says why on stderr.
+back to another identity, and it says why on stderr. After unlocking, run `env` again in
+that shell to pick up the identity.
 
 Each request takes the credential once, before reading its body, and uses it to the end.
 A lock that lands later lets that request finish and refuses the next one. Such a request
@@ -165,7 +173,8 @@ operation can stop between steps (a branch pushed, its pull request not yet open
 never inside one request.
 
 A lock that arrives while an unlock is being checked against GitHub wins: the unlock is
-discarded and reports that it was locked.
+discarded and reports that it was locked. Only an explicit `lock` does this; the old unlock
+expiring while a renewal is checked does not refuse the renewal.
 
 ## What the agent does on 423
 

@@ -291,7 +291,7 @@ def parse(data: dict) -> Config:
             raise ConfigError(f"repos outside the installation owner {cfg.owner!r}: {', '.join(stray)}")
     if any("/" not in r for r in cfg.policy.repos if r != "*"):
         raise ConfigError("policy.repos entries must be owner/name")
-    for name in ("socket", "admin_socket"):
+    for name in ("socket", "admin_socket") if cfg.unlock is not None else ("socket",):
         if len(getattr(cfg, name).encode()) > 107:
             raise ConfigError(f"server.{name} path is longer than the 107-byte Unix socket limit")
     return cfg

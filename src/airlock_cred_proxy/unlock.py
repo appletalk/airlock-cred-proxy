@@ -15,7 +15,7 @@ import time
 from http.server import BaseHTTPRequestHandler
 
 from . import credentials
-from .config import Config, ConfigError
+from .config import Config
 
 ADMIN_MAX_BODY = 256 * 1024
 ADMIN_TIMEOUT = 30
@@ -40,7 +40,7 @@ def deadline(now: float, cfg: Config, for_seconds: int | None = None) -> float:
     u = cfg.unlock
     d = now + u.max_lifetime
     if for_seconds is not None:
-        d = min(d, now + for_seconds)
+        d = now + min(for_seconds, u.max_lifetime)
     if u.expire_at is not None:
         # Naive local time plus mktime with isdst=-1 keeps "18:00" at 18:00 across DST changes.
         local = dt.datetime.fromtimestamp(now)
@@ -104,7 +104,6 @@ class UnlockGate:
 
     def _drop(self, reason):
         # Dropping the credential drops its cache of minted App tokens with it.
-        self._generation += 1
         self._cred = None
         self._expires_at = self._boot_deadline = None
         self._locked_reason = reason
@@ -143,21 +142,23 @@ class UnlockGate:
             if self._generation != gen:
                 raise Locked("locked while the unlock was being checked")
             now = self.clock()
+            expires = deadline(now, self.cfg, for_seconds)     # before installing anything
             self._cred = cred
             self.identity = cred.identity
-            self._expires_at = deadline(now, self.cfg, for_seconds)
-            self._boot_deadline = self.boot() + (self._expires_at - now)
+            self._expires_at = expires
+            self._boot_deadline = self.boot() + (expires - now)
             self._last_used = now
         self._wake.set()
         self._log(event="unlock", identity=cred.identity.get("login"), expires_at=fmt(self._expires_at))
         return self.status()
 
     def lock(self, reason="locked by operator"):
+        # Only an explicit lock discards an unlock in flight; expiry during a renewal does not.
         with self._lock:
+            self._generation += 1
             if self._cred is not None:
                 self._drop(reason)
             else:
-                self._generation += 1
                 self._locked_reason = reason
 
     def status(self) -> dict:
@@ -278,7 +279,7 @@ class AdminHandler(BaseHTTPRequestHandler):
         except Locked as e:
             rec.update(decision="deny", reason=str(e))
             return self._reply(409, {"error": rec["reason"], **gate.status()})
-        except (ConfigError, credentials.UpstreamError, KeyError, ValueError, OSError) as e:
+        except Exception as e:  # noqa: BLE001 - any failure to build leaves the gate as it was
             rec.update(decision="deny", reason=f"credential did not work: {e.__class__.__name__}")
             return self._reply(422, {"error": rec["reason"], **gate.status()})
         finally:

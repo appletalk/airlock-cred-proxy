@@ -18,6 +18,20 @@ class State:
         self.seen = []            # (method, path, authorization) for every non-app request
         self.pulls = {}           # (repo, num) -> {"base": ..., "head": ..., "head_repo": ...}
         self.nodes = {}           # node id -> {"baseRefName": ..., "nameWithOwner": ...}
+        self.app_public_key = None   # when set, App JWTs must be signed by its private key, as on GitHub
+
+
+def _jwt_ok(jwt, public_key):
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding
+    try:
+        head, body, sig = jwt.split(".")
+        raw = base64.urlsafe_b64decode(sig + "=" * (-len(sig) % 4))
+        public_key.verify(raw, f"{head}.{body}".encode(), padding.PKCS1v15(), hashes.SHA256())
+        return True
+    except (ValueError, InvalidSignature):
+        return False
 
 
 def _read_body(h):
@@ -58,6 +72,8 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/app"):
             if not auth.startswith("Bearer "):
                 return self._json(401, {"message": "jwt required"})
+            if st.app_public_key is not None and not _jwt_ok(auth[7:], st.app_public_key):
+                return self._json(401, {"message": "A JSON web token could not be decoded"})
             if path == "/app":
                 return self._json(200, {"slug": "test-agent", "id": 99})
             if path == "/app/installations":
