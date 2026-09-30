@@ -1,4 +1,4 @@
-# gh-cred-proxy
+# airlock-cred-proxy
 
 A credential-injecting, policy-enforcing proxy between an AI coding agent (or any
 untrusted process) and GitHub.
@@ -41,7 +41,7 @@ Anything the proxy cannot classify is refused.
   Unix socket, tested with curl 8.22). It
   connects to `github.com:80` through the proxy and sends plain HTTP, which the proxy
   inspects like any other request.
-- **`gh-cred-proxy env`** prints the environment for one shell: URL rewrites from
+- **`airlock-cred-proxy env`** prints the environment for one shell: URL rewrites from
   `https://`, `git@` and `ssh://` to plain `http://github.com/`, the SOCKS proxy for that
   URL, an empty credential helper, the `gh` settings, and the bot's git author and
   committer identity.
@@ -55,8 +55,8 @@ agent's shell with your own SSH key.
 ## Install
 
 ```
-git clone https://github.com/appletalk/gh-cred-proxy
-cd gh-cred-proxy
+git clone https://github.com/appletalk/airlock-cred-proxy
+cd airlock-cred-proxy
 python3 -m venv .venv
 .venv/bin/pip install --require-hashes -r requirements.lock
 .venv/bin/pip install --no-deps .
@@ -71,10 +71,10 @@ service unit; systemd creates the socket with the right group and mode.
 See `examples/config.toml`. Validate and dry-run before deploying:
 
 ```
-gh-cred-proxy check-config --config config.toml
-gh-cred-proxy check-config --config config.toml --resolve     # also load the key and mint a token
-gh-cred-proxy explain --config config.toml POST https://api.github.com/repos/o/r/pulls/1/reviews --body review.json
-gh-cred-proxy explain --config config.toml POST https://github.com/o/r.git/git-receive-pack --ref refs/heads/main
+airlock-cred-proxy check-config --config config.toml
+airlock-cred-proxy check-config --config config.toml --resolve     # also load the key and mint a token
+airlock-cred-proxy explain --config config.toml POST https://api.github.com/repos/o/r/pulls/1/reviews --body review.json
+airlock-cred-proxy explain --config config.toml POST https://github.com/o/r.git/git-receive-pack --ref refs/heads/main
 ```
 
 `explain` exits 0 when the request would be allowed and 1 when refused. It makes no
@@ -83,11 +83,11 @@ network calls, so checks that need GitHub (a PR's real base) show as `upstream_c
 ## Run
 
 ```
-gh-cred-proxy serve --config /etc/gh-cred-proxy/app.toml                   # the service
-gh-cred-proxy status --socket /run/gh-cred-proxy/app.sock                  # health and identity
-eval "$(gh-cred-proxy env --socket /run/gh-cred-proxy/app.sock)"           # per shell
-gh-cred-proxy audit --log /var/log/gh-cred-proxy/app.jsonl --denied        # what was refused, and why
-gh-cred-proxy audit --log /var/log/gh-cred-proxy/app.jsonl --summary
+airlock-cred-proxy serve --config /etc/airlock-cred-proxy/app.toml                   # the service
+airlock-cred-proxy status --socket /run/airlock-cred-proxy/app.sock                  # health and identity
+eval "$(airlock-cred-proxy env --socket /run/airlock-cred-proxy/app.sock)"           # per shell
+airlock-cred-proxy audit --log /var/log/airlock-cred-proxy/app.jsonl --denied        # what was refused, and why
+airlock-cred-proxy audit --log /var/log/airlock-cred-proxy/app.jsonl --summary
 ```
 
 A refused `git push` shows only `HTTP 403` on the client, because git does not print

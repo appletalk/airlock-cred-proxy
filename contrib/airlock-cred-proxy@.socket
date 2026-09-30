@@ -1,0 +1,15 @@
+# systemd creates the socket with the right owner and mode, so the service needs no chown.
+# systemctl enable --now airlock-cred-proxy@app.socket
+[Unit]
+Description=airlock-cred-proxy socket (%i)
+
+[Socket]
+ListenStream=/run/airlock-cred-proxy/%i.sock
+SocketUser=airlock-cred-proxy
+SocketGroup=airlock-cred-proxy-clients
+SocketMode=0660
+DirectoryMode=0755
+Accept=no
+
+[Install]
+WantedBy=sockets.target

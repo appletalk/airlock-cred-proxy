@@ -1,4 +1,4 @@
-"""gh-cred-proxy command line."""
+"""airlock-cred-proxy command line."""
 import argparse
 import collections
 import json
@@ -18,7 +18,7 @@ def _safe(v) -> str:
 
 
 def _state_dir():
-    return os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "gh-cred-proxy")
+    return os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "airlock-cred-proxy")
 
 
 def cmd_serve(a):
@@ -82,8 +82,8 @@ def cmd_explain(a):
 
 def cmd_status(a):
     try:
-        h = client.local_get(a.socket, "/_gh-cred-proxy/health")
-        i = client.local_get(a.socket, "/_gh-cred-proxy/identity")
+        h = client.local_get(a.socket, "/_airlock-cred-proxy/health")
+        i = client.local_get(a.socket, "/_airlock-cred-proxy/identity")
     except (OSError, RuntimeError) as e:
         print(f"proxy unreachable at {a.socket}: {e}", file=sys.stderr)
         return 1
@@ -126,7 +126,7 @@ def cmd_audit(a):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="gh-cred-proxy", description=__doc__)
+    ap = argparse.ArgumentParser(prog="airlock-cred-proxy", description=__doc__)
     ap.add_argument("--version", action="version", version=__version__)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sd = _state_dir()
@@ -171,7 +171,7 @@ def main(argv=None):
         print(f"config error: {e}", file=sys.stderr)
         return 2
     except ImportError as e:
-        print(f"gh-cred-proxy {a.cmd} needs the full install (pip install -r requirements.lock): {e}",
+        print(f"airlock-cred-proxy {a.cmd} needs the full install (pip install -r requirements.lock): {e}",
               file=sys.stderr)
         return 2
 

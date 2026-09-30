@@ -15,7 +15,7 @@ from unittest import mock
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
-from gh_cred_proxy import client, config, credentials, server
+from airlock_cred_proxy import client, config, credentials, server
 
 from . import fakegithub
 
@@ -98,7 +98,7 @@ class ProxyTest(unittest.TestCase):
     # ------------------------------------------------------------ identity and credentials
 
     def test_identity_endpoint(self):
-        i = client.local_get(self.sock, "/_gh-cred-proxy/identity")
+        i = client.local_get(self.sock, "/_airlock-cred-proxy/identity")
         self.assertEqual(i["login"], "test-agent[bot]")
         self.assertEqual(i["email"], "4242+test-agent[bot]@users.noreply.github.com")
 

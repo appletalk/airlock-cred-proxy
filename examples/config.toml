@@ -1,10 +1,10 @@
-# gh-cred-proxy example: a GitHub App identity for an agent that works on two repos.
+# airlock-cred-proxy example: a GitHub App identity for an agent that works on two repos.
 
 [server]
-socket = "/run/gh-cred-proxy/app.sock"      # 107-byte limit on Unix socket paths
+socket = "/run/airlock-cred-proxy/app.sock"      # 107-byte limit on Unix socket paths
 socket_mode = "0660"
-socket_group = "gh-cred-proxy-clients"       # only when not socket-activated (contrib/ units set it there)
-audit_log = "/var/log/gh-cred-proxy/app.jsonl"   # "-" for stderr (journald)
+socket_group = "airlock-cred-proxy-clients"       # only when not socket-activated (contrib/ units set it there)
+audit_log = "/var/log/airlock-cred-proxy/app.jsonl"   # "-" for stderr (journald)
 # api_url = "https://api.github.com"
 # git_url = "https://github.com"
 

@@ -28,7 +28,7 @@ def api_call(base_url: str, method: str, path: str, auth: str, body=None, timeou
     conn = conn_cls(u.hostname, u.port, timeout=timeout)
     try:
         headers = {"Authorization": auth, "Accept": "application/vnd.github+json",
-                   "User-Agent": "gh-cred-proxy", "X-GitHub-Api-Version": "2022-11-28"}
+                   "User-Agent": "airlock-cred-proxy", "X-GitHub-Api-Version": "2022-11-28"}
         data = None
         if body is not None:
             data = json.dumps(body).encode()

@@ -33,8 +33,8 @@ REQUEST_DEADLINE = 30          # whole-request budget for the request line, head
 CHUNK = 64 * 1024
 CLIENT_TIMEOUT = 60
 UPSTREAM_TIMEOUT = 600
-IDENTITY_PATH = "/_gh-cred-proxy/identity"
-HEALTH_PATH = "/_gh-cred-proxy/health"
+IDENTITY_PATH = "/_airlock-cred-proxy/identity"
+HEALTH_PATH = "/_airlock-cred-proxy/health"
 
 HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te",
               "trailer", "transfer-encoding", "upgrade", "proxy-connection"}
@@ -289,7 +289,7 @@ class Proxy:
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "gh-cred-proxy"
+    server_version = "airlock-cred-proxy"
     sys_version = ""
     timeout = CLIENT_TIMEOUT
     socks_target = None
@@ -349,7 +349,7 @@ class Handler(BaseHTTPRequestHandler):
             return {}
 
     def _refuse(self, status, reason, git):
-        msg = f"gh-cred-proxy: {reason}"
+        msg = f"airlock-cred-proxy: {reason}"
         if git:
             data, ctype = (msg + "\n").encode(), "text/plain; charset=utf-8"
         else:

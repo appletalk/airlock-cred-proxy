@@ -5,7 +5,7 @@ import os
 import tempfile
 import unittest
 
-from gh_cred_proxy import cli
+from airlock_cred_proxy import cli
 
 
 class Audit(unittest.TestCase):

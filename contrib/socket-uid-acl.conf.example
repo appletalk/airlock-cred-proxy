@@ -1,4 +1,4 @@
-# Drop-in for gh-cred-proxy@<name>.socket: re-apply a uid ACL each time systemd creates
+# Drop-in for airlock-cred-proxy@<name>.socket: re-apply a uid ACL each time systemd creates
 # the socket. Rootless containers keep the host user's uid but drop its supplementary
 # groups, so the socket group does not reach a box; the uid ACL does.
 #
@@ -7,8 +7,8 @@
 #
 # Install (replace YOUR_USER, and otto with the instance name):
 #   sudo install -D -m 0644 socket-uid-acl.conf.example \
-#     /etc/systemd/system/gh-cred-proxy@otto.socket.d/uid-acl.conf
-#   sudo systemctl daemon-reload && sudo systemctl restart gh-cred-proxy@otto.socket
+#     /etc/systemd/system/airlock-cred-proxy@otto.socket.d/uid-acl.conf
+#   sudo systemctl daemon-reload && sudo systemctl restart airlock-cred-proxy@otto.socket
 # Restarting the socket unit recreates the socket; relaunch any box that mounts it.
 [Socket]
-ExecStartPost=/usr/bin/setfacl -m u:YOUR_USER:rw /run/gh-cred-proxy/%i.sock
+ExecStartPost=/usr/bin/setfacl -m u:YOUR_USER:rw /run/airlock-cred-proxy/%i.sock

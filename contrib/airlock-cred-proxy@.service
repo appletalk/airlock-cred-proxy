@@ -1,19 +1,19 @@
-# One instance per identity, started by gh-cred-proxy@<name>.socket.
-# Config: /etc/gh-cred-proxy/%i.toml (root:gh-cred-proxy 0640)
-# Key:    /etc/gh-cred-proxy/%i.key  (root:root 0600, read by systemd, handed over via LoadCredential)
+# One instance per identity, started by airlock-cred-proxy@<name>.socket.
+# Config: /etc/airlock-cred-proxy/%i.toml (root:airlock-cred-proxy 0640)
+# Key:    /etc/airlock-cred-proxy/%i.key  (root:root 0600, read by systemd, handed over via LoadCredential)
 [Unit]
-Description=gh-cred-proxy (%i)
-Requires=gh-cred-proxy@%i.socket
-After=gh-cred-proxy@%i.socket network-online.target
+Description=airlock-cred-proxy (%i)
+Requires=airlock-cred-proxy@%i.socket
+After=airlock-cred-proxy@%i.socket network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=gh-cred-proxy
-Group=gh-cred-proxy
-ExecStart=/opt/gh-cred-proxy/.venv/bin/gh-cred-proxy serve --config /etc/gh-cred-proxy/%i.toml
-LoadCredential=app-key:/etc/gh-cred-proxy/%i.key
-LogsDirectory=gh-cred-proxy
+User=airlock-cred-proxy
+Group=airlock-cred-proxy
+ExecStart=/opt/airlock-cred-proxy/.venv/bin/airlock-cred-proxy serve --config /etc/airlock-cred-proxy/%i.toml
+LoadCredential=app-key:/etc/airlock-cred-proxy/%i.key
+LogsDirectory=airlock-cred-proxy
 LogsDirectoryMode=0750
 UMask=0077
 Restart=on-failure

@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "gh-cred-proxy"
+name = "airlock-cred-proxy"
 version = "0.1.0"
 description = "Credential-injecting, policy-enforcing proxy between a sandboxed agent and GitHub"
 readme = "README.md"
@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.scripts]
-gh-cred-proxy = "gh_cred_proxy.cli:main"
+airlock-cred-proxy = "airlock_cred_proxy.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

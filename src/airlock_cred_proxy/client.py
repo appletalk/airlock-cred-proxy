@@ -5,7 +5,7 @@ import os
 import shlex
 import socket
 
-PLACEHOLDER_TOKEN = "gh-cred-proxy-placeholder"
+PLACEHOLDER_TOKEN = "airlock-cred-proxy-placeholder"
 
 
 class UnixHTTPConnection(http.client.HTTPConnection):
@@ -23,7 +23,7 @@ class UnixHTTPConnection(http.client.HTTPConnection):
 def local_get(sock_path: str, path: str) -> dict:
     c = UnixHTTPConnection(sock_path)
     try:
-        c.request("GET", path, headers={"Host": "gh-cred-proxy"})
+        c.request("GET", path, headers={"Host": "airlock-cred-proxy"})
         r = c.getresponse()
         data = r.read()
         if r.status != 200:
@@ -36,7 +36,7 @@ def local_get(sock_path: str, path: str) -> dict:
 def environment(sock_path: str, gh_config_dir: str) -> dict:
     """git reaches the socket as a SOCKS5 proxy; gh through http_unix_socket."""
     sock_path = os.path.abspath(sock_path)
-    ident = local_get(sock_path, "/_gh-cred-proxy/identity")
+    ident = local_get(sock_path, "/_airlock-cred-proxy/identity")
     git_host = ident["git_host"]
     os.makedirs(gh_config_dir, mode=0o700, exist_ok=True)
     cfg = os.path.join(gh_config_dir, "config.yml")

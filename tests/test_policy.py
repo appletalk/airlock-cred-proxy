@@ -1,7 +1,7 @@
 import time
 import unittest
 
-from gh_cred_proxy import config, policy
+from airlock_cred_proxy import config, policy
 
 
 def pkt(s: bytes) -> bytes:

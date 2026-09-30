@@ -6,7 +6,7 @@ import unittest
 
 CHILD = r'''
 import os, socket, sys
-from gh_cred_proxy import config, server
+from airlock_cred_proxy import config, server
 path = sys.argv[1]
 s = socket.socket(socket.AF_UNIX); s.bind(path); s.listen(4)
 os.dup2(s.fileno(), 3)

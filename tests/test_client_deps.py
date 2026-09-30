@@ -14,7 +14,7 @@ class Block:
         if name.split(".")[0] in ("graphql", "cryptography"):
             raise ImportError("blocked for this test: " + name)
 sys.meta_path.insert(0, Block())
-from gh_cred_proxy import cli
+from airlock_cred_proxy import cli
 
 # A fake proxy answering the two local endpoints, so the SUCCESS paths run too.
 d = tempfile.mkdtemp(prefix="gcpdeps.", dir="/tmp")
@@ -36,8 +36,8 @@ open(log, "w").write('{"ts":"t","decision":"deny","reason":"r"}\n')
 rcs = [cli.main(["status", "--socket", sock]),
        cli.main(["env", "--socket", sock, "--gh-config-dir", os.path.join(d, "gh")]),
        cli.main(["audit", "--log", log, "--denied"]),
-       cli.main(["status", "--socket", "/nonexistent/gh-cred-proxy.sock"]),
-       cli.main(["env", "--socket", "/nonexistent/gh-cred-proxy.sock", "--gh-config-dir", os.path.join(d, "gh2")])]
+       cli.main(["status", "--socket", "/nonexistent/airlock-cred-proxy.sock"]),
+       cli.main(["env", "--socket", "/nonexistent/airlock-cred-proxy.sock", "--gh-config-dir", os.path.join(d, "gh2")])]
 print("rcs", rcs)
 '''
 

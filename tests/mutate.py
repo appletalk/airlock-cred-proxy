@@ -51,7 +51,7 @@ bad = 0
 for label, f, old, new in MUTANTS:
     d = tempfile.mkdtemp(prefix="gcpmut.", dir="/tmp")
     shutil.copytree(SRC, d, dirs_exist_ok=True, ignore=shutil.ignore_patterns(".venv", ".git"))
-    p = os.path.join(d, "src/gh_cred_proxy", f)
+    p = os.path.join(d, "src/airlock_cred_proxy", f)
     s = open(p).read()
     if s.count(old) != 1:
         print(f"SKIP  {label}: pattern count {s.count(old)}"); bad += 1; continue
