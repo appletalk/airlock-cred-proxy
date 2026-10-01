@@ -211,15 +211,28 @@ class Proxy:
             raise Refused(403, f"repo owner {owner!r} is not the installation owner", repo)
         return (name,)
 
-    def perms(self, access):
-        return self.cfg.policy.permissions if access == "write" else self.cfg.policy.read_permissions()
+    def mint_scope(self, d: policy.Decision):
+        """(repo names, permissions) for the token an allowed request gets; see policy.token_scope."""
+        repos, perms = policy.token_scope(self.cfg.policy, d)
+        if d.repo is not None:
+            return self.scope(d.repo), perms
+        if repos is None:
+            return None, perms
+        if not repos:
+            raise Refused(403, "no policy repo is granted the permissions this request needs")
+        return tuple(sorted(self.scope(r)[0] for r in repos)), perms
 
-    def resolve_lookup(self, d: policy.Decision, cred):
-        """Checks that need GitHub's view of a pull request. Any failure refuses the request."""
+    def resolve_lookup(self, d: policy.Decision, cred, scope, perms):
+        """Checks that need GitHub's view of a pull request. Any failure refuses the request.
+
+        Lookups read with the repos of the token the request will get, so a pull request that
+        token cannot reach is refused here rather than looked up with a wider one.
+        """
         lk, pol = d.lookup, self.cfg.policy
+        read = {k: "read" for k in perms}
         if "pr_base" in lk or "pr_head" in lk:
             num = lk.get("pr_base") or lk.get("pr_head")
-            auth = cred.authorization(self.scope(d.repo), self.perms("read"))
+            auth = cred.authorization(scope, read)
             try:
                 pr = credentials.api_call(self.cfg.api_url, "GET", f"/repos/{d.repo}/pulls/{num}", auth)
                 base = pr["base"]["ref"]
@@ -236,7 +249,7 @@ class Proxy:
         if items:
             q = ("query($ids:[ID!]!){nodes(ids:$ids){... on PullRequest"
                  "{baseRefName repository{nameWithOwner}}}}")
-            auth = cred.authorization(None, self.perms("read"))
+            auth = cred.authorization(scope, read)
             try:
                 r = credentials.api_call(self.cfg.api_url, "POST", "/graphql", auth,
                                          {"query": q, "variables": {"ids": [i["id"] for i in items]}})
@@ -509,10 +522,9 @@ class Handler(BaseHTTPRequestHandler):
             rec.update(repo=d.repo, reason=d.reason, access=d.access, **({"detail": d.detail} if d.detail else {}))
             if not d.allow:
                 raise Refused(403, d.reason, d.repo, d.detail)
+            scope, perms = px.mint_scope(d)
             if d.lookup:
-                px.resolve_lookup(d, cred)
-            scope = px.scope(d.repo)
-            perms = px.perms(d.access)
+                px.resolve_lookup(d, cred, scope, perms)
             self.deadline_at = None
             self.connection.settimeout(CLIENT_TIMEOUT)   # writes use it too; drop the residual deadline
             try:

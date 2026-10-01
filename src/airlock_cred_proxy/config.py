@@ -63,6 +63,9 @@ class Policy:
     rest_writes: bool
     projects: frozenset[str] | None
     read_paths: tuple[str, ...]
+    # Lower-cased owner/name -> that repo's own effective permission set, which replaces
+    # `permissions` for it. Empty when no [policy.repo] table sets permissions.
+    repo_permission_sets: dict[str, dict[str, str]] = field(default_factory=dict)
 
     def repo_allowed(self, full_name: str) -> bool:
         if "*" in self.repos:
@@ -84,8 +87,31 @@ class Policy:
                     pats += extra
         return any(fnmatchcase(base, p) for p in pats)
 
-    def read_permissions(self) -> dict[str, str]:
-        return {k: "read" for k in self.permissions}
+    def repo_permissions(self, full_name: str | None) -> dict[str, str]:
+        """The most a token may carry on this repo: its own set if it has one, else the global set."""
+        if full_name is None:
+            return self.permissions
+        return self.repo_permission_sets.get(full_name.lower(), self.permissions)
+
+    def shared_permissions(self) -> dict[str, str]:
+        """The most a token covering every policy repo may carry: each permission every repo
+        grants, at the lowest level any of them grants it. The global set when none is narrowed."""
+        if not self.repo_permission_sets:
+            return self.permissions
+        sets = [self.repo_permissions(r) for r in self.repos]
+        keys = set.intersection(*(set(s) for s in sets))
+        return {k: "write" if all(s[k] == "write" for s in sets) else "read" for k in keys}
+
+    def full_repos(self) -> list[str] | None:
+        """Policy repos whose effective set is the whole global set; None when no repo is narrowed."""
+        if not self.repo_permission_sets:
+            return None
+        return [r for r in self.repos if self.repo_permissions(r) == self.permissions]
+
+    def read_permissions(self, full_name: str | None = None) -> dict[str, str]:
+        """Read-only form of one repo's set, or of the shared set for a token covering every repo."""
+        perms = self.repo_permissions(full_name) if full_name else self.shared_permissions()
+        return {k: "read" for k in perms}
 
 
 @dataclass
@@ -140,6 +166,47 @@ def _projects(table: dict):
     if not isinstance(v, list) or not all(isinstance(p, str) and p.startswith("PVT_") for p in v):
         raise ConfigError("policy.projects must be a list of project node IDs (PVT_...)")
     return frozenset(v)
+
+
+def _permissions(table, where: str) -> dict[str, str]:
+    if not isinstance(table, dict):
+        raise ConfigError(f"{where} must be a table of permission = \"read\" or \"write\"")
+    for k, v in table.items():
+        if v not in ACCESS_LEVELS:
+            raise ConfigError(f"{where}.{k} must be read or write")
+    return {"metadata": "read", **table}
+
+
+def missing_grants(wanted: dict[str, str], granted: dict[str, str]) -> list[str]:
+    """Entries of `wanted` that `granted` does not cover, as "name:level"."""
+    rank = {"read": 1, "write": 2, "admin": 3}
+    return sorted(f"{k}:{v}" for k, v in wanted.items() if rank.get(granted.get(k), 0) < rank[v])
+
+
+def _repo_tables(tables, perms: dict[str, str]):
+    """[policy.repo."owner/name"] tables -> (merge_denied_bases by repo, permission sets by lower-cased repo)."""
+    if not isinstance(tables, dict):
+        raise ConfigError("[policy.repo] must be a table of \"owner/name\" tables")
+    bases, sets, seen = {}, {}, set()
+    for name, t in tables.items():
+        where = f"policy.repo.{name!r}"
+        if not isinstance(t, dict):
+            raise ConfigError(f"[{where}] must be a table")
+        unknown = set(t) - {"merge_denied_bases", "permissions"}
+        if unknown:
+            raise ConfigError(f"[{where}] has unknown keys: {', '.join(sorted(unknown))}")
+        if name.lower() in seen:
+            raise ConfigError(f"[{where}] is given twice (repo names are compared without case)")
+        seen.add(name.lower())
+        bases[name] = list(t.get("merge_denied_bases", []))
+        if "permissions" in t:
+            own = _permissions(t["permissions"], f"{where}.permissions")
+            over = missing_grants(own, perms)
+            if over:
+                raise ConfigError(f"{where}.permissions must be a subset of policy.permissions; "
+                                  f"it adds {', '.join(over)}")
+            sets[name.lower()] = own
+    return bases, sets
 
 
 def _need(table: dict, key: str, where: str):
@@ -210,17 +277,14 @@ def parse(data: dict) -> Config:
     if kind not in ("github-app", "token"):
         raise ConfigError("identity.kind must be 'github-app' or 'token'")
 
-    perms = pol.get("permissions", {"contents": "write", "pull_requests": "write", "issues": "write"})
-    for k, v in perms.items():
-        if v not in ACCESS_LEVELS:
-            raise ConfigError(f"policy.permissions.{k} must be read or write")
-    perms = {"metadata": "read", **perms}
+    perms = _permissions(pol.get("permissions", {"contents": "write", "pull_requests": "write", "issues": "write"}),
+                         "policy.permissions")
 
     repos = pol.get("repos")
     if not repos:
         raise ConfigError("policy.repos is required; use [\"*\"] to allow every repo the credential reaches")
 
-    repo_tables = pol.get("repo", {})
+    repo_bases, repo_sets = _repo_tables(pol.get("repo", {}), perms)
     mutations = pol.get("graphql_mutations")
     if mutations is not None:
         unknown = sorted(set(mutations) - SAFE_MUTATIONS)
@@ -235,12 +299,13 @@ def parse(data: dict) -> Config:
         push_tags=_bool(pol, "push_tags", False),
         deny_approvals=_bool(pol, "deny_approvals", True),
         merge_denied_bases=list(pol.get("merge_denied_bases", [])),
-        repo_merge_denied_bases={n: list(t.get("merge_denied_bases", [])) for n, t in repo_tables.items()},
+        repo_merge_denied_bases=repo_bases,
         mutations=frozenset(mutations) if mutations is not None else DEFAULT_MUTATIONS,
         rest_allow=[(m.upper(), p) for m, p in pol.get("rest_allow", [])],
         rest_writes=_bool(pol, "rest_writes", True),
         projects=_projects(pol),
         read_paths=tuple(pol.get("read_paths", DEFAULT_READ_PATHS)),
+        repo_permission_sets=repo_sets,
     )
 
     api_url = server.get("api_url", "https://api.github.com")
@@ -291,6 +356,17 @@ def parse(data: dict) -> Config:
             raise ConfigError(f"repos outside the installation owner {cfg.owner!r}: {', '.join(stray)}")
     if any("/" not in r for r in cfg.policy.repos if r != "*"):
         raise ConfigError("policy.repos entries must be owner/name")
+    if repo_sets:
+        # A per-repo set is enforced by what the token carries. A fixed token carries what it
+        # carries, and a GraphQL token for "*" would reach the narrowed repo with the full set.
+        if kind == "token":
+            raise ConfigError("per-repo permissions need a github-app identity; a token cannot be narrowed")
+        if "*" in cfg.policy.repos:
+            raise ConfigError("per-repo permissions need policy.repos to list every repo, not \"*\"")
+        listed = {r.lower() for r in cfg.policy.repos}
+        unlisted = sorted(n for n in repo_sets if n not in listed)
+        if unlisted:
+            raise ConfigError(f"per-repo permissions for repos not in policy.repos: {', '.join(unlisted)}")
     for name in ("socket", "admin_socket") if cfg.unlock is not None else ("socket",):
         if len(getattr(cfg, name).encode()) > 107:
             raise ConfigError(f"server.{name} path is longer than the 107-byte Unix socket limit")

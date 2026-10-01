@@ -30,6 +30,17 @@ def cmd_serve(a):
     server.serve(config.load(a.config))
 
 
+def _perms(perms) -> str:
+    return ", ".join(f"{k}:{v}" for k, v in sorted(perms.items()))
+
+
+def _graphql_tokens(p) -> list[tuple[str, list[str] | None, dict]]:
+    """The tokens GraphQL requests get when some repo has its own permission set: (kind, repos, perms)."""
+    read = {k: "read" for k in p.shared_permissions()}
+    return [("queries", None, read), ("issue mutations", None, p.shared_permissions()),
+            ("other mutations", p.full_repos(), p.permissions)]
+
+
 def cmd_check(a):
     cfg = config.load(a.config)
     p = cfg.policy
@@ -38,7 +49,19 @@ def cmd_check(a):
     print(f"  socket     {cfg.socket} mode={oct(cfg.socket_mode)} group={cfg.socket_group or '-'}")
     print(f"  hosts      api={cfg.api_host} -> {cfg.api_url}  git={cfg.git_host} -> {cfg.git_url}")
     print(f"  repos      {', '.join(p.repos)}")
-    print(f"  perms      {', '.join(f'{k}:{v}' for k, v in sorted(p.permissions.items()))}")
+    print(f"  perms      {_perms(p.permissions)}")
+    if p.repo_permission_sets:
+        for r in p.repos:
+            own = " (own set)" if r.lower() in p.repo_permission_sets else ""
+            print(f"    {r}{own}: {_perms(p.repo_permissions(r))}")
+        print("  graphql    one token per request, so it carries no more than every repo it covers allows:")
+        for kind, repos, perms in _graphql_tokens(p):
+            where = ", ".join(repos) if repos else ("none: refused" if repos == [] else "every policy repo")
+            print(f"    {kind:16} {where}: {_perms(perms)}")
+        lost = sorted(set(p.permissions) - set(p.shared_permissions()))
+        if lost:
+            print(f"  note       GraphQL queries (most of gh's reads) cannot read {', '.join(lost)} on any repo; "
+                  "grant them as read in each repo's own set to keep those reads")
     print(f"  push       branches={p.push_branches or 'none'} tags={p.push_tags}")
     print(f"  approvals  {'denied' if p.deny_approvals else 'allowed'}")
     print(f"  protected  {p.merge_denied_bases or 'none'}" +
@@ -62,8 +85,13 @@ def cmd_check(a):
         cred = credentials.build(cfg)
         print(f"credential ok: {cred.identity['login']} (id {cred.identity['id']})")
         if cfg.kind == "github-app":
+            over = config.missing_grants(p.permissions, cred.installation_permissions())
+            if over:
+                raise config.ConfigError(f"policy.permissions asks for more than installation "
+                                         f"{cred.installation_id} grants: {', '.join(over)}")
             cred.token(None, p.read_permissions())
-            print(f"  installation {cred.installation_id}; read token minted for the policy's repos")
+            print(f"  installation {cred.installation_id}; grants policy.permissions; "
+                  "read token minted for the policy's repos")
 
 
 def cmd_explain(a):
@@ -89,6 +117,9 @@ def cmd_explain(a):
         out["detail"] = d.detail
     if d.lookup:
         out["upstream_check"] = d.lookup
+    if d.allow and cfg.kind == "github-app":
+        repos, perms = policy.token_scope(cfg.policy, d)
+        out["token"] = {"repos": repos if repos is not None else "every policy repo", "permissions": perms}
     print(json.dumps(out, indent=2))
     return 0 if d.allow else 1
 

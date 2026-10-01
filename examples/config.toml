@@ -26,6 +26,8 @@ merge_denied_bases = ["main"]                # merges into these are always refu
 
 [policy.repo."example-org/service-b"]
 merge_denied_bases = ["release/*"]           # added to the global list for this repo
+# permissions = { issues = "write", contents = "read", pull_requests = "read" }
+#                                            # replaces the global set for this repo; see docs/repo-permissions.md
 
 # Optional:
 # graphql_mutations = ["createPullRequest", "addComment"]     # replaces the default allowlist

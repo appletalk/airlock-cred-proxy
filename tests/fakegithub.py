@@ -19,6 +19,8 @@ class State:
         self.pulls = {}           # (repo, num) -> {"base": ..., "head": ..., "head_repo": ...}
         self.nodes = {}           # node id -> {"baseRefName": ..., "nameWithOwner": ...}
         self.app_public_key = None   # when set, App JWTs must be signed by its private key, as on GitHub
+        self.installation_permissions = {"metadata": "read", "contents": "write",
+                                         "pull_requests": "write", "issues": "write"}
 
 
 def _jwt_ok(jwt, public_key):
@@ -76,6 +78,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(401, {"message": "A JSON web token could not be decoded"})
             if path == "/app":
                 return self._json(200, {"slug": "test-agent", "id": 99})
+            if path == "/app/installations/7" and self.command == "GET":
+                return self._json(200, {"id": 7, "permissions": st.installation_permissions})
             if path == "/app/installations":
                 return self._json(200, [{"id": 7, "account": {"login": "acme"}}])
             m = re.fullmatch(r"/app/installations/7/access_tokens", path)
@@ -123,8 +127,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"data": None})
             if "nodes(ids:" in q["query"]:
                 nodes = []
+                scope = st.tokens[tok].get("repositories")
                 for i in q["variables"]["ids"]:
                     n = st.nodes.get(i)
+                    if n and scope is not None and n["nameWithOwner"].split("/", 1)[1] not in scope:
+                        n = None
                     nodes.append({"baseRefName": n["baseRefName"],
                                   "repository": {"nameWithOwner": n["nameWithOwner"]}} if n else None)
                 return self._json(200, {"data": {"nodes": nodes}})

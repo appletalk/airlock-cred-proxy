@@ -40,7 +40,10 @@ reaches the socket as a SOCKS5 proxy.
   PR, not what the request claims. Anything that moves a ref, a PR's base or merges goes
   through a checker; mutations with no possible checker cannot be enabled.
 - **Mint narrow.** Each token covers one repo (or the allowlist, for GraphQL) and only
-  the access the request needs.
+  the access the request needs. A repo with its own permission set never gets a token
+  carrying more than that set, so a GraphQL mutation outside the issue-level ones is
+  minted over only the repos holding the full set
+  ([docs/repo-permissions.md](docs/repo-permissions.md)).
 - **Log decisions, not secrets.** The audit log never contains tokens or bodies.
 
 ## Unlock

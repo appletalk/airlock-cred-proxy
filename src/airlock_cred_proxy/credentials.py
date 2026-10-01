@@ -84,10 +84,16 @@ class AppCredential:
         return {"login": login, "id": user["id"],
                 "email": f"{user['id']}+{login}@users.noreply.github.com"}
 
+    def installation_permissions(self) -> dict[str, str]:
+        inst = api_call(self.cfg.api_url, "GET", f"/app/installations/{self.installation_id}", f"Bearer {self._jwt()}")
+        return inst["permissions"]
+
     def token(self, repos: tuple[str, ...] | None, permissions: dict[str, str]) -> str:
         """repos: repo names (no owner) to scope to, or None for every repo the policy allows."""
         if repos is None and "*" not in self.cfg.policy.repos:
             repos = tuple(sorted(r.split("/", 1)[1] for r in self.cfg.policy.repos))
+        if repos is not None and not repos:
+            raise ValueError("refusing to mint a token for an empty repo list")
         key = (repos, tuple(sorted(permissions.items())))
         with self._lock:
             hit = self._cache.get(key)

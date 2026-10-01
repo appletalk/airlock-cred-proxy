@@ -19,6 +19,7 @@ what the agent may reach, and log everything.
 | Credential isolation | The client's own `Authorization` is always stripped. The key stays in the proxy process. |
 | Least privilege per request | A GitHub App token is minted for the one repo a request touches, read-only for reads, write only for writes. Tokens are cached until five minutes before expiry. |
 | Repo allowlist | Requests for repos outside `policy.repos` are refused before anything reaches GitHub. |
+| Per-repo permissions | A repo can have a narrower permission set of its own (for example issues only). No token ever carries more on a repo than its set, GraphQL included, and REST and git writes it lacks are refused at the proxy. See [docs/repo-permissions.md](docs/repo-permissions.md). |
 | Branch pushes | `git push`, ref API writes, contents API writes and merges-into-branch only reach branches matching `push_branches`. Tags are refused unless `push_tags = true`. A push that mixes allowed and refused refs is refused whole. |
 | No approvals | Approving reviews are refused over REST and GraphQL, including through variables, variable defaults and aliases. The agent cannot approve its own or anyone else's pull request. |
 | Protected bases | Merging a PR into a `merge_denied_bases` branch is refused. The proxy looks up the PR's real base on GitHub instead of trusting the request. Retargeting a PR onto a protected base is refused over REST and GraphQL. Auto-merge and the merge queue cannot be enabled, because they act after the check. |
@@ -79,6 +80,19 @@ airlock-cred-proxy explain --config config.toml POST https://github.com/o/r.git/
 
 `explain` exits 0 when the request would be allowed and 1 when refused. It makes no
 network calls, so checks that need GitHub (a PR's real base) show as `upstream_check`.
+For a GitHub App it also shows the token the request would get (`token`).
+
+To let the identity work issues on a repo without pushing or opening pull requests there,
+give that repo its own permission set:
+
+```
+[policy.repo."example-org/infra"]
+permissions = { issues = "write", contents = "read", pull_requests = "read" }
+```
+
+The set replaces the global one for that repo and must be a subset of it.
+[docs/repo-permissions.md](docs/repo-permissions.md) explains how GraphQL tokens are
+scoped around it and why the read entries keep `gh`'s reads working.
 
 ## Run
 

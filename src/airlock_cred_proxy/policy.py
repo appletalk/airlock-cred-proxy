@@ -28,6 +28,8 @@ class Decision:
     access: str = "read"             # token level to mint: read or write
     detail: dict = field(default_factory=dict)
     lookup: dict | None = None       # a follow-up check the server must resolve upstream
+    needs: tuple[str, ...] = ()      # permissions a write needs at write level on `repo`
+    across: str = "full"             # repo-less writes: "full" repos only, or "all" with the shared set
 
 
 def deny(reason, **kw):
@@ -36,6 +38,33 @@ def deny(reason, **kw):
 
 def allow(reason, **kw):
     return Decision(True, reason, **kw)
+
+
+def within_repo_set(policy: Policy, d: Decision) -> Decision:
+    """Refuse a write on a repo with its own permission set when that set lacks what the write needs.
+
+    The token minted for it could not do the write either; this refuses it before GitHub does.
+    """
+    own = policy.repo_permission_sets.get(d.repo.lower()) if d.allow and d.repo else None
+    if own is not None and d.access == "write":
+        missing = [p for p in d.needs if own.get(p) != "write"]
+        if missing:
+            return deny(f"{d.repo} is not granted {', '.join(missing)} write", repo=d.repo, access="write")
+    return d
+
+
+def token_scope(policy: Policy, d: Decision) -> tuple[list[str] | None, dict[str, str]]:
+    """Repos (owner/name; None for every policy repo) and permissions for an allowed request's token.
+
+    The token never carries more on any repo it covers than that repo's effective set.
+    """
+    if d.repo is not None:
+        repos, perms = [d.repo], policy.repo_permissions(d.repo)
+    elif d.access == "read" or d.across == "all":
+        repos, perms = None, policy.shared_permissions()
+    else:
+        repos, perms = policy.full_repos(), policy.permissions
+    return repos, (perms if d.access == "write" else {k: "read" for k in perms})
 
 
 # ---------------------------------------------------------------- git smart HTTP
@@ -59,13 +88,14 @@ def git_request(policy: Policy, method: str, path: str, query: str) -> Decision:
         if query == "service=git-upload-pack":
             return allow("fetch advertisement", repo=repo)
         if query == "service=git-receive-pack":
-            return allow("push advertisement", repo=repo, access="write")
+            return within_repo_set(policy, allow("push advertisement", repo=repo, access="write", needs=("contents",)))
         return deny("dumb HTTP or unknown service", repo=repo)
     if method != "POST" or query:
         return deny(f"{svc} must be a POST without a query string", repo=repo)
     if svc == "git-upload-pack":
         return allow("fetch", repo=repo)
-    return allow("push; ref updates checked separately", repo=repo, access="write")
+    return within_repo_set(policy, allow("push; ref updates checked separately", repo=repo, access="write",
+                                         needs=("contents",)))
 
 
 class RefCommandParser:
@@ -149,38 +179,40 @@ def check_ref_updates(policy: Policy, repo: str, updates) -> Decision:
 _NAME = r"[A-Za-z0-9_.-]+"
 R = rf"^/repos/(?P<owner>{_NAME})/(?P<repo>{_NAME})"
 N = r"(?P<num>\d+)"
+# The permission each needs at write level, checked against a repo's own permission set.
+PR, ISSUES, CONTENTS = ("pull_requests",), ("issues",), ("contents",)
 REST_WRITES = [
-    ("POST", R + r"/pulls$", "pr_create"),
-    ("PATCH", R + rf"/pulls/{N}$", "pr_patch"),
-    ("PUT", R + rf"/pulls/{N}/merge$", "merge"),
-    ("PUT", R + rf"/pulls/{N}/update-branch$", "update_branch"),
-    ("POST", R + rf"/pulls/{N}/reviews$", "review"),
-    ("PUT", R + rf"/pulls/{N}/reviews/\d+$", "plain"),
-    ("POST", R + rf"/pulls/{N}/reviews/\d+/events$", "review"),
-    ("POST", R + rf"/pulls/{N}/comments$", "plain"),
-    ("POST", R + rf"/pulls/{N}/comments/\d+/replies$", "plain"),
-    ("POST", R + rf"/pulls/{N}/requested_reviewers$", "plain"),
-    ("DELETE", R + rf"/pulls/{N}/requested_reviewers$", "plain"),
-    ("PATCH", R + r"/pulls/comments/\d+$", "plain"),
-    ("POST", R + r"/issues$", "plain"),
-    ("PATCH", R + rf"/issues/{N}$", "plain"),
-    ("POST", R + rf"/issues/{N}/comments$", "plain"),
-    ("PATCH", R + r"/issues/comments/\d+$", "plain"),
-    ("DELETE", R + r"/issues/comments/\d+$", "plain"),
-    ("POST", R + rf"/issues/{N}/labels$", "plain"),
-    ("PUT", R + rf"/issues/{N}/labels$", "plain"),
-    ("DELETE", R + rf"/issues/{N}/labels(/[^/]+)?$", "plain"),
-    ("POST", R + rf"/issues/{N}/assignees$", "plain"),
-    ("DELETE", R + rf"/issues/{N}/assignees$", "plain"),
-    ("POST", R + r"/git/(blobs|trees|commits)$", "plain"),
-    ("POST", R + r"/git/refs$", "ref_create"),
-    ("PATCH", R + r"/git/refs/heads/(?P<branch>.+)$", "ref_branch"),
-    ("DELETE", R + r"/git/refs/heads/(?P<branch>.+)$", "ref_branch"),
-    ("PUT", R + r"/contents/.+$", "contents"),
-    ("DELETE", R + r"/contents/.+$", "contents"),
-    ("POST", R + r"/merges$", "merges"),
+    ("POST", R + r"/pulls$", "pr_create", PR),
+    ("PATCH", R + rf"/pulls/{N}$", "pr_patch", PR),
+    ("PUT", R + rf"/pulls/{N}/merge$", "merge", CONTENTS + PR),
+    ("PUT", R + rf"/pulls/{N}/update-branch$", "update_branch", CONTENTS + PR),
+    ("POST", R + rf"/pulls/{N}/reviews$", "review", PR),
+    ("PUT", R + rf"/pulls/{N}/reviews/\d+$", "plain", PR),
+    ("POST", R + rf"/pulls/{N}/reviews/\d+/events$", "review", PR),
+    ("POST", R + rf"/pulls/{N}/comments$", "plain", PR),
+    ("POST", R + rf"/pulls/{N}/comments/\d+/replies$", "plain", PR),
+    ("POST", R + rf"/pulls/{N}/requested_reviewers$", "plain", PR),
+    ("DELETE", R + rf"/pulls/{N}/requested_reviewers$", "plain", PR),
+    ("PATCH", R + r"/pulls/comments/\d+$", "plain", PR),
+    ("POST", R + r"/issues$", "plain", ISSUES),
+    ("PATCH", R + rf"/issues/{N}$", "plain", ISSUES),
+    ("POST", R + rf"/issues/{N}/comments$", "plain", ISSUES),
+    ("PATCH", R + r"/issues/comments/\d+$", "plain", ISSUES),
+    ("DELETE", R + r"/issues/comments/\d+$", "plain", ISSUES),
+    ("POST", R + rf"/issues/{N}/labels$", "plain", ISSUES),
+    ("PUT", R + rf"/issues/{N}/labels$", "plain", ISSUES),
+    ("DELETE", R + rf"/issues/{N}/labels(/[^/]+)?$", "plain", ISSUES),
+    ("POST", R + rf"/issues/{N}/assignees$", "plain", ISSUES),
+    ("DELETE", R + rf"/issues/{N}/assignees$", "plain", ISSUES),
+    ("POST", R + r"/git/(blobs|trees|commits)$", "plain", CONTENTS),
+    ("POST", R + r"/git/refs$", "ref_create", CONTENTS),
+    ("PATCH", R + r"/git/refs/heads/(?P<branch>.+)$", "ref_branch", CONTENTS),
+    ("DELETE", R + r"/git/refs/heads/(?P<branch>.+)$", "ref_branch", CONTENTS),
+    ("PUT", R + r"/contents/.+$", "contents", CONTENTS),
+    ("DELETE", R + r"/contents/.+$", "contents", CONTENTS),
+    ("POST", R + r"/merges$", "merges", CONTENTS),
 ]
-REST_WRITES = [(m, re.compile(p), k) for m, p, k in REST_WRITES]
+REST_WRITES = [(m, re.compile(p), k, n) for m, p, k, n in REST_WRITES]
 BODY_CHECKERS = {"review", "ref_create", "contents", "merges", "pr_patch", "pr_create"}
 REPO_PATH = re.compile(R + r"(/.*)?$")
 CONTENTS_PATH = re.compile(R + r"/contents/")
@@ -229,7 +261,7 @@ def _str(body: dict, key: str):
 
 def rest_needs_body(method: str, path: str) -> bool:
     """Whether the checker for this endpoint inspects the body (so the server buffers it)."""
-    for m, rx, kind in REST_WRITES:
+    for m, rx, kind, _ in REST_WRITES:
         if m == method and rx.match(path):
             return kind in BODY_CHECKERS
     return False
@@ -257,16 +289,18 @@ def rest_request(policy: Policy, method: str, path: str, body: bytes | None) -> 
     if not policy.rest_writes:
         return deny("REST writes are disabled for this identity", repo=repo, access="write")
 
-    for m, rx, kind in REST_WRITES:
+    for m, rx, kind, needs in REST_WRITES:
         if m != method:
             continue
         mm = rx.match(path)
         if not mm:
             continue
         try:
-            return _rest_check(policy, kind, repo, mm, _json(body) if kind in BODY_CHECKERS else {})
+            d = _rest_check(policy, kind, repo, mm, _json(body) if kind in BODY_CHECKERS else {})
         except ValueError as e:
             return deny(str(e), repo=repo, access="write")
+        d.needs = needs
+        return within_repo_set(policy, d)
 
     if repo and any(m == method and _glob_path(p, path) for m, p in policy.rest_allow):
         return allow("rest_allow", repo=repo, access="write")
@@ -327,6 +361,15 @@ REVIEW_MUTATIONS = {"addPullRequestReview", "submitPullRequestReview"}
 PROJECT_MUTATIONS = {"addProjectV2ItemById", "archiveProjectV2Item", "clearProjectV2ItemFieldValue",
                      "deleteProjectV2Item", "unarchiveProjectV2Item", "updateProjectV2ItemFieldValue",
                      "updateProjectV2ItemPosition"}
+# Mutations that act only on issues, comments, labels, assignees and reactions. A document made
+# of these alone gets a token over every policy repo with the shared permission set; any other
+# mutation gets the global set over only the repos that hold all of it. The comment edits are
+# here deliberately: an IssueComment (on an issue or a pull request) needs issues write only.
+ISSUE_MUTATIONS = frozenset({
+    "addAssigneesToAssignable", "addComment", "addLabelsToLabelable", "addReaction", "closeIssue",
+    "createIssue", "deleteIssueComment", "removeAssigneesFromAssignable", "removeLabelsFromLabelable",
+    "removeReaction", "reopenIssue", "updateIssue", "updateIssueComment",
+})
 UNRESOLVED = object()
 
 
@@ -479,7 +522,15 @@ def graphql_request(policy: Policy, body: bytes) -> Decision:
     if not ops:
         return deny("graphql document has no operation")
     mutating = "mutation" in ops
+    # The shared set must hold issues write for the issue token to do anything; when a repo lacks
+    # it, issue mutations take the full token instead, which also stays off the narrowed repos.
+    issue_only = fields and all(f in ISSUE_MUTATIONS for f in fields)
+    across = "all" if issue_only and policy.shared_permissions().get("issues") == "write" else "full"
+    if mutating and across == "full" and policy.full_repos() == []:
+        return deny("no policy repo is granted the full permission set, which this mutation needs",
+                    detail={"mutations": fields})
     return allow("graphql " + ("mutation" if mutating else "query"),
                  access="write" if mutating else "read",
                  detail={"ops": ops, "mutations": fields},
-                 lookup={"pr_nodes": lookups} if lookups else None)
+                 lookup={"pr_nodes": lookups} if lookups else None,
+                 across=across)
